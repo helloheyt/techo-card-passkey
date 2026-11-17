@@ -1,0 +1,2524 @@
+diff --git a/crates/runner-nordic/Cargo.lock b/crates/runner-nordic/Cargo.lock
+index 06525d7..a66b745 100644
+--- a/crates/runner-nordic/Cargo.lock
++++ b/crates/runner-nordic/Cargo.lock
+@@ -1050,6 +1050,13 @@ dependencies = [
+  "void",
+ ]
+ 
++[[package]]
++name = "nrf-nfc"
++version = "0.1.0"
++dependencies = [
++ "cortex-m",
++]
++
+ [[package]]
+ name = "nrf-usbd"
+ version = "0.3.0"
+@@ -1144,6 +1151,10 @@ dependencies = [
+  "sha2 0.11.0",
+ ]
+ 
++[[package]]
++name = "p256-cm4"
++version = "0.1.0"
++
+ [[package]]
+ name = "panic-abort"
+ version = "0.3.2"
+@@ -1350,7 +1361,9 @@ dependencies = [
+  "embedded-hal 1.0.0",
+  "embedded-storage",
+  "header",
++ "nrf-nfc",
+  "nrf52840-hal",
++ "p256-cm4",
+  "panic-abort",
+  "panic-probe",
+  "rubble",
+diff --git a/crates/runner-nordic/Cargo.toml b/crates/runner-nordic/Cargo.toml
+index fef8fda..dd1f94d 100644
+--- a/crates/runner-nordic/Cargo.toml
++++ b/crates/runner-nordic/Cargo.toml
+@@ -7,6 +7,8 @@ publish = false
+ 
+ [dependencies]
+ ble-adv = { path = "crates/ble-adv", optional = true }
++nrf-nfc = { path = "crates/nrf-nfc", optional = true }
++p256-cm4 = { path = "crates/p256-cm4", optional = true }
+ bytemuck = { version = "1.25.2", default-features = false, optional = true }
+ cortex-m = { version = "0.7.9", features = ["critical-section-single-core"] }
+ cortex-m-rt = { version = "0.7.7", features = ["set-vtor"] }
+@@ -66,11 +68,20 @@ features = [
+ 
+ [features]
+ aes128-ccm = ["_crypto", "dep:typenum", "wasefire-scheduler/board-api-crypto-aes128-ccm"]
++# Fast P-256 ECDH/ECDSA (P256-Cortex-M4 assembly). Exclusive with software-crypto-p256-ecdh/ecdsa.
++p256-cm4 = [
++  "_crypto",
++  "dep:p256-cm4",
++  "wasefire-scheduler/board-api-crypto-p256-ecdh",
++  "wasefire-scheduler/board-api-crypto-p256-ecdsa",
++]
+ ble-adv = ["_vendor", "dep:ble-adv", "dep:rubble", "dep:rubble-nrf5x"]
+ fpc2534 = ["fpc2534-sensor", "wasefire-scheduler/board-api-fingerprint-matcher"]
+ fpc2534-sensor = ["_gpio_port1", "dep:bytemuck", "wasefire-scheduler/board-api-fingerprint-sensor"]
+ gpio = ["_gpio_port1", "_vendor", "wasefire-scheduler/board-api-gpio"]
+ test-vendor = ["_vendor", "dep:data-encoding", "dep:syscall-test"]
++# LilyGO T-Echo Card: NFC Type 4 Tag (CTAP over NFC) vendor API. Uses NFCT and TIMER0.
++techo-nfc = ["_vendor", "dep:nrf-nfc"]
+ uart = ["wasefire-scheduler/board-api-uart"]
+ usb-ctap = ["_usb", "dep:usbd-hid", "wasefire-scheduler/board-api-usb-ctap"]
+ usb-serial = ["_usb", "dep:usbd-serial", "wasefire-scheduler/board-api-usb-serial"]
+@@ -94,6 +105,7 @@ software-crypto-sha256 = ["_crypto", "wasefire-scheduler/software-crypto-sha256"
+ board-devkit = ["header/board-devkit"]
+ board-dongle = ["_gpio_port1", "header/board-dongle"]
+ board-makerdiary = ["header/board-dongle"]
++board-techo = ["_gpio_port1", "header/board-dongle"]
+ 
+ # Exactly one is enabled by xtask.
+ debug = [
+@@ -143,3 +155,28 @@ clippy.mod_module_files = "warn"
+ clippy.uninlined_format_args = "allow"
+ clippy.unit_arg = "allow"
+ rust.unused_crate_dependencies = "warn"
++
++# T-Echo NFC: the software P-256/SHA-256/AES are ~3x slower at opt-level "z", and over NFC each
++# CTAP command must finish within the reader's frame waiting time. Speed-optimize only them.
++[profile.release.package.p256]
++opt-level = 3
++[profile.release.package.primeorder]
++opt-level = 3
++[profile.release.package.elliptic-curve]
++opt-level = 3
++[profile.release.package.crypto-bigint]
++opt-level = 3
++[profile.release.package.ecdsa]
++opt-level = 3
++[profile.release.package.ff]
++opt-level = 3
++[profile.release.package.group]
++opt-level = 3
++[profile.release.package.sha2]
++opt-level = 3
++[profile.release.package.hmac]
++opt-level = 3
++[profile.release.package.aes]
++opt-level = 3
++[profile.release.package.cbc]
++opt-level = 3
+diff --git a/crates/runner-nordic/build.rs b/crates/runner-nordic/build.rs
+index d3ae0e0..c0c0302 100644
+--- a/crates/runner-nordic/build.rs
++++ b/crates/runner-nordic/build.rs
+@@ -18,10 +18,11 @@ fn main() {
+         "devkit"
+     } else if std::env::var_os("CARGO_FEATURE_BOARD_DONGLE").is_some()
+         || std::env::var_os("CARGO_FEATURE_BOARD_MAKERDIARY").is_some()
++        || std::env::var_os("CARGO_FEATURE_BOARD_TECHO").is_some()
+     {
+         "dongle"
+     } else {
+-        panic!("one of board-{{devkit,dongle,makerdiary}} must be enabled")
++        panic!("one of board-{{devkit,dongle,makerdiary,techo}} must be enabled")
+     };
+     std::fs::copy(format!("board-{board}.x"), out.join("board.x")).unwrap();
+     println!("cargo::rerun-if-changed=board-{board}.x");
+diff --git a/crates/runner-nordic/crates/bootloader/Cargo.toml b/crates/runner-nordic/crates/bootloader/Cargo.toml
+index 76308c7..c98f70c 100644
+--- a/crates/runner-nordic/crates/bootloader/Cargo.toml
++++ b/crates/runner-nordic/crates/bootloader/Cargo.toml
+@@ -22,6 +22,8 @@ single-sided = []
+ # Exactly one is enabled by xtask.
+ board-devkit = ["header/board-devkit"]
+ board-dongle = ["header/board-dongle"]
++# LilyGO T-Echo Card bring-up: one long buzzer tone when the bootloader starts.
++techo-beep = []
+ 
+ [profile.release]
+ lto = true
+diff --git a/crates/runner-nordic/crates/bootloader/src/main.rs b/crates/runner-nordic/crates/bootloader/src/main.rs
+index e0f53c7..bfacc28 100644
+--- a/crates/runner-nordic/crates/bootloader/src/main.rs
++++ b/crates/runner-nordic/crates/bootloader/src/main.rs
+@@ -29,6 +29,10 @@ exactly_one_of!["board-devkit", "board-dongle"];
+ 
+ #[entry]
+ fn main() -> ! {
++    #[cfg(feature = "techo-beep")]
++    techo::erase_page();
++    #[cfg(feature = "techo-beep")]
++    techo::checkpoint(1);
+     let mut new = Header::new(Side::A);
+     if cfg!(feature = "single-sided") {
+         unsafe { asm::bootload(new.firmware() as *const u32) };
+@@ -43,6 +47,14 @@ fn main() -> ! {
+     // update, both sides have the same timestamp and side B is running, because side A has consumed
+     // all its attempts.
+     let cur = if mark(new) { new } else { old };
++    #[cfg(feature = "techo-beep")]
++    {
++        let fw = cur.firmware() as *const u32;
++        techo::flash_word(0x10, fw as u32);
++        techo::flash_word(0x11, unsafe { core::ptr::read_volatile(fw) });
++        techo::flash_word(0x12, unsafe { core::ptr::read_volatile(fw.add(1)) });
++        techo::checkpoint(2);
++    }
+     unsafe { asm::bootload(cur.firmware() as *const u32) };
+ }
+ 
+@@ -52,8 +64,9 @@ fn mark(header: Header) -> bool {
+     let nvmc = Peripherals::take().unwrap().NVMC;
+     if !header.has_firmware() {
+         // We erase the storage on the very first run for the dongle, since we can't erase the
+-        // device from DFU.
+-        #[cfg(feature = "board-dongle")]
++        // device from DFU. Not on the T-Echo Card (techo-beep): it is updated by UF2 files that
++        // leave the store alone, and the user's passkeys and PIN must survive firmware updates.
++        #[cfg(all(feature = "board-dongle", not(feature = "techo-beep")))]
+         if header.attempt(0).free() {
+             let ptr = header::STORE_RANGE.start as *mut u8;
+             let len = header::STORE_RANGE.len();
+@@ -80,3 +93,68 @@ fn mark_word(header: Header, nvmc: NVMC, attempt: u32) {
+     let mut nvmc = Nvmc::new(nvmc, storage);
+     nvmc.write(attempt - header, &[0; 4]).unwrap();
+ }
++
++
++// LilyGO T-Echo Card bring-up diagnostics (same marker page as the runner's techo_debug).
++#[cfg(feature = "techo-beep")]
++mod techo {
++    const MARKER_PAGE: usize = 0x000E_9000;
++    fn write(addr: usize, value: u32) {
++        unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
++    }
++    fn read(addr: usize) -> u32 {
++        unsafe { core::ptr::read_volatile(addr as *const u32) }
++    }
++    pub fn flash_word(index: usize, value: u32) {
++        let addr = MARKER_PAGE + 4 * index;
++        if read(addr) != 0xffff_ffff {
++            return;
++        }
++        while read(0x4001_E400) == 0 {}
++        write(0x4001_E504, 1);
++        while read(0x4001_E400) == 0 {}
++        write(addr, value);
++        while read(0x4001_E400) == 0 {}
++        write(0x4001_E504, 0);
++        while read(0x4001_E400) == 0 {}
++    }
++    /// Erases the marker page on every boot, so the markers always describe the latest boot
++    /// (the page is read back after double-pressing B, which does not run this code).
++    pub fn erase_page() {
++        let resetreas = read(0x4000_0400);
++        while read(0x4001_E400) == 0 {}
++        write(0x4001_E504, 2);
++        while read(0x4001_E400) == 0 {}
++        write(0x4001_E508, MARKER_PAGE as u32);
++        while read(0x4001_E400) == 0 {}
++        write(0x4001_E504, 0);
++        while read(0x4001_E400) == 0 {}
++        flash_word(0x13, resetreas);
++        // The NFC flight-recorder log (0xE0000..0xE9000) is NOT erased here: the runner erases it
++        // on its first flush, so the log of the previous session survives the boot that the
++        // first press of a double-press B causes.
++    }
++    pub fn checkpoint(n: usize) {
++        flash_word(n, 0xC0DE_0000 | n as u32);
++    }
++    pub fn fault(source: u32, pc: u32, lr: u32) -> ! {
++        flash_word(0x40, 0xFA17_FA17);
++        flash_word(0x41, source);
++        flash_word(0x42, pc);
++        flash_word(0x43, lr);
++        flash_word(0x44, read(0xE000_ED28));
++        flash_word(0x45, read(0xE000_ED2C));
++        flash_word(0x46, read(0xE000_ED38));
++        flash_word(0x47, read(0xE000_ED34));
++        loop {
++            cortex_m::asm::nop();
++        }
++    }
++}
++
++// Faults raised before the runner sets VTOR are forwarded by the MBR to this vector table.
++#[cfg(feature = "techo-beep")]
++#[cortex_m_rt::exception]
++unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
++    techo::fault(0x0000_0001, ef.pc(), ef.lr())
++}
+diff --git a/crates/runner-nordic/crates/nrf-nfc/Cargo.toml b/crates/runner-nordic/crates/nrf-nfc/Cargo.toml
+new file mode 100644
+index 0000000..e93f9a2
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "nrf-nfc"
++version = "0.1.0"
++edition = "2024"
++description = "nRF52840 NFC Type 4 Tag (ISO-DEP) stack for the T-Echo Card: nrfx_nfct + Nordic libnfc_t4t + Rust platform glue"
++license = "MIT AND LicenseRef-Nordic-5-Clause"
++links = "nrf_nfc"
++publish = false
++
++[dependencies]
++cortex-m = "0.7.9"
+diff --git a/crates/runner-nordic/crates/nrf-nfc/build.rs b/crates/runner-nordic/crates/nrf-nfc/build.rs
+new file mode 100644
+index 0000000..50c553b
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/build.rs
+@@ -0,0 +1,9 @@
++// Links the vendored static archives (see vendor/README.md for provenance).
++fn main() {
++    let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("vendor/lib");
++    println!("cargo:rustc-link-search=native={}", dir.display());
++    println!("cargo:rustc-link-lib=static=nfc_t4t");
++    println!("cargo:rustc-link-lib=static=nrfx_nfct");
++    println!("cargo:rerun-if-changed=vendor/lib/libnfc_t4t.a");
++    println!("cargo:rerun-if-changed=vendor/lib/libnrfx_nfct.a");
++}
+diff --git a/crates/runner-nordic/crates/nrf-nfc/src/lib.rs b/crates/runner-nordic/crates/nrf-nfc/src/lib.rs
+new file mode 100644
+index 0000000..a49f8c9
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/src/lib.rs
+@@ -0,0 +1,639 @@
++//! nRF52840 NFC Type 4 Tag (raw ISO-DEP) stack for the LilyGO T-Echo Card port of OpenSK.
++//!
++//! Thin FFI over two static archives built or downloaded by the installer (see `vendor/README.md`):
++//! - `libnrfx_nfct.a`: Nordic's nrfx NFCT driver (BSD-3-Clause) (+ TIMER0 workaround timer),
++//! - `libnfc_t4t.a`: Nordic's Type 4 Tag library (ISO 14443-4: RATS/ATS, I-block chaining, WTX).
++//!
++//! Plus the C-ABI platform hooks those archives call back into, adapted from solokeys/solo2
++//! `components/nrf-nfc` (MIT). Both archives use packed (`-fshort-enums`) enums, so every enum
++//! crossing the boundary is a `u8` here.
++//!
++//! Assumptions: HFXO is started by the runner at boot and stays on, so a detected field is
++//! activated synchronously; NFCT and TIMER0 interrupts are routed to [`irq_nfct`] and
++//! [`irq_timer0`] by the runner.
++
++#![no_std]
++
++use core::ffi::c_void;
++
++/// `nfc_t4t_event_t` values.
++pub mod event {
++    pub const FIELD_ON: u8 = 1;
++    pub const FIELD_OFF: u8 = 2;
++    pub const DATA_TRANSMITTED: u8 = 5;
++    pub const DATA_IND: u8 = 6;
++}
++
++/// `NFC_T4T_DI_FLAG_MORE`: more fragments of the same APDU follow.
++pub const DI_FLAG_MORE: u32 = 0x01;
++
++/// Application callback: `(context, event, data, data_length, flags)`.
++pub type Callback = unsafe extern "C" fn(*mut c_void, u8, *const u8, usize, u32);
++
++unsafe extern "C" {
++    fn nfc_t4t_setup(callback: Callback, context: *mut c_void) -> i32;
++    fn nfc_t4t_emulation_start() -> i32;
++    fn nfc_t4t_emulation_stop() -> i32;
++    fn nfc_t4t_response_pdu_send(pdu: *const u8, pdu_length: usize) -> i32;
++    fn nfc_t4t_parameter_set(id: u8, data: *const core::ffi::c_void, data_length: usize) -> i32;
++    fn nrfx_nfct_irq_handler();
++    fn nrfx_nfct_rx_impl(desc: *const DataDesc) -> i32;
++    fn nrfx_nfct_tx_impl(desc: *const DataDesc, delay_mode: u8) -> i32;
++    fn nrfx_nfct_workaround_timer_handler();
++    fn nrfx_nfct_state_force(state: u8);
++}
++
++/// Bring-up diagnostics: [OR of nrfx event ids seen by the platform handler, number of
++/// ACTIVATE forces, number of deferred callbacks, NFCTAGSTATE right after the last force,
++/// number of failed buffer allocations].
++pub static DIAG: [core::sync::atomic::AtomicU32; 7] = [const { core::sync::atomic::AtomicU32::new(0) }; 7];
++
++/// Optional bring-up hook `(index, value)` installed by the runner to persist diagnostics.
++pub static mut MARK: Option<fn(usize, u32)> = None;
++
++fn mark(index: usize, value: u32) {
++    if let Some(f) = unsafe { MARK } {
++        f(index, value);
++    }
++}
++
++fn reg(addr: usize) -> u32 {
++    unsafe { (addr as *const u32).read_volatile() }
++}
++
++fn diag_or(i: usize, v: u32) {
++    DIAG[i].fetch_or(v, core::sync::atomic::Ordering::Relaxed);
++}
++
++fn diag_inc(i: usize) {
++    DIAG[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++}
++
++/// `nrfx_nfct_data_desc_t`.
++#[repr(C)]
++pub struct DataDesc {
++    pub data_size: u32,
++    pub p_data: *const u8,
++}
++
++// ── Bring-up trace: (tag, a, b, cycle counter) entries, flushed by the runner ─────────────────
++
++pub const TRACE_ENTRIES: usize = 1024; // RAM ring; persisted by appending to the flash log
++pub static TRACE: [core::sync::atomic::AtomicU32; 4 * TRACE_ENTRIES] =
++    [const { core::sync::atomic::AtomicU32::new(0) }; 4 * TRACE_ENTRIES];
++pub static TRACE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++
++pub mod tag {
++    pub const IRQ_BEFORE: u32 = 1;
++    pub const IRQ_AFTER: u32 = 2;
++    pub const RX_CALL: u32 = 3;
++    pub const RX_RET: u32 = 4;
++    pub const TX_CALL: u32 = 5;
++    pub const TX_RET: u32 = 6;
++    pub const PLATFORM_EVT: u32 = 7;
++    pub const CB_REQUEST: u32 = 8;
++    pub const APP_EVT: u32 = 9;
++    pub const TIMER0: u32 = 10;
++}
++
++fn cycles() -> u32 {
++    unsafe { (0xE000_1004 as *const u32).read_volatile() } // DWT->CYCCNT
++}
++
++fn enable_cycle_counter() {
++    unsafe {
++        let demcr = 0xE000_EDFC as *mut u32;
++        demcr.write_volatile(demcr.read_volatile() | (1 << 24)); // TRCENA
++        let ctrl = 0xE000_1000 as *mut u32;
++        ctrl.write_volatile(ctrl.read_volatile() | 1); // CYCCNTENA
++    }
++}
++
++/// Low-level (per-frame / per-interrupt) tracing; off: only APDU-level events are kept so the
++/// ring holds a whole CTAP exchange.
++pub static VERBOSE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++fn vtrace(tag: u32, a: u32, b: u32) {
++    if VERBOSE.load(core::sync::atomic::Ordering::Relaxed) {
++        trace(tag, a, b);
++    }
++}
++
++/// Appends a trace entry (ring buffer: keeps the last TRACE_ENTRIES entries).
++pub fn trace(tag: u32, a: u32, b: u32) {
++    use core::sync::atomic::Ordering::Relaxed;
++    let i = TRACE_LEN.fetch_add(1, Relaxed) % TRACE_ENTRIES;
++    TRACE[4 * i].store(tag, Relaxed);
++    TRACE[4 * i + 1].store(a, Relaxed);
++    TRACE[4 * i + 2].store(b, Relaxed);
++    TRACE[4 * i + 3].store(cycles(), Relaxed);
++}
++
++/// Persists the RAM trace through the runner hook (blocks ~40 us per word: never call it while a
++/// reader is talking to us).
++pub fn flush_trace() {
++    use core::sync::atomic::Ordering::Relaxed;
++    let total = TRACE_LEN.load(Relaxed);
++    let n = total.min(TRACE_ENTRIES);
++    mark(0xFE, 0x7E00_0000 | n as u32);
++    mark(0x6B, total as u32); // total entries ever (older ones were overwritten)
++    for (i, d) in DIAG.iter().enumerate() {
++        mark(0x60 + i, d.load(Relaxed));
++    }
++    mark(0x67, reg(0x4000_5410)); // NFCTAGSTATE now
++    mark(0x68, reg(0x4000_5304)); // NFCT INTEN now
++    mark(0x69, reg(0x4000_543C)); // FIELDPRESENT now
++    mark(0x6A, reg(0xE000_E100)); // NVIC ISER0 now
++    flush_log();
++}
++
++/// Flash log (flight recorder): 0xE0000..0xE9000 (free in the dongle layout, inside the UF2 app
++/// space). Erased by the runner on its first flush of a boot (so the previous session's log
++/// survives reboots without NFC activity); marker 0x6E records that this boot wrote it.
++const LOG_START: usize = 0x000E_0000;
++const LOG_END: usize = 0x000E_9000;
++static LOG_FLUSHED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++
++fn nvmc_write(addr: usize, value: u32) {
++    unsafe {
++        let ready = 0x4001_E400 as *const u32;
++        let config = 0x4001_E504 as *mut u32;
++        if (addr as *const u32).read_volatile() != 0xFFFF_FFFF {
++            return;
++        }
++        while ready.read_volatile() == 0 {}
++        config.write_volatile(1);
++        while ready.read_volatile() == 0 {}
++        (addr as *mut u32).write_volatile(value);
++        while ready.read_volatile() == 0 {}
++        config.write_volatile(0);
++        while ready.read_volatile() == 0 {}
++    }
++}
++
++fn nvmc_erase(page: usize) {
++    unsafe {
++        let ready = 0x4001_E400 as *const u32;
++        let config = 0x4001_E504 as *mut u32;
++        while ready.read_volatile() == 0 {}
++        config.write_volatile(2);
++        while ready.read_volatile() == 0 {}
++        (0x4001_E508 as *mut u32).write_volatile(page as u32); // ERASEPAGE
++        while ready.read_volatile() == 0 {}
++        config.write_volatile(0);
++        while ready.read_volatile() == 0 {}
++    }
++}
++
++/// Appends the trace entries recorded since the last call to the flash log (stalls the CPU about
++/// 160 us per entry: never call it while a reader is in the field).
++pub fn flush_log() {
++    use core::sync::atomic::Ordering::Relaxed;
++    let total = TRACE_LEN.load(Relaxed);
++    static ERASED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++    if !ERASED.swap(true, Relaxed) {
++        let mut page = LOG_START;
++        while page < LOG_END {
++            nvmc_erase(page);
++            page += 0x1000;
++        }
++        mark(0x6E, 0x10C);
++    }
++    let mut from = LOG_FLUSHED.load(Relaxed);
++    if total - from > TRACE_ENTRIES {
++        from = total - TRACE_ENTRIES; // overwritten in RAM: record the gap
++        let pos = LOG_START + 16 * LOG_FLUSHED.load(Relaxed).min((LOG_END - LOG_START) / 16);
++        let _ = pos;
++    }
++    for k in from .. total {
++        let addr = LOG_START + 16 * k;
++        if addr + 16 > LOG_END {
++            break;
++        }
++        let slot = k % TRACE_ENTRIES;
++        for w in 0 .. 4 {
++            nvmc_write(addr + 4 * w, TRACE[4 * slot + w].load(Relaxed));
++        }
++    }
++    LOG_FLUSHED.store(total, Relaxed);
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn nrfx_nfct_rx(desc: *const DataDesc) -> i32 {
++    let d = unsafe { &*desc };
++    if d.data_size < 16 {
++        trace(tag::RX_CALL, d.data_size, d.p_data as u32); // short RX (S(WTX) reply)
++    } else {
++        vtrace(tag::RX_CALL, d.data_size, d.p_data as u32);
++    }
++    // After our own frame the TXFRAMEEND->ENABLERXDATA shortcut has already armed the RX into our
++    // TX buffer (MAXLEN 257). Re-arming here (ENABLERXDATA) hits the reader's answer mid-frame
++    // whenever the interrupt is late, turning it into garbage (CRC error, size 509/8190, seen
++    // after chained I-blocks on iPhone and Android). So when the NFCT is already receiving into
++    // our buffer, only enable the RX interrupts as nrfx would; the frame is copied into the
++    // library's buffer when it ends (see `nfc_platform_event_handler`).
++    use core::sync::atomic::Ordering::Relaxed;
++    LIB_RX_PTR.store(d.p_data as u32, Relaxed);
++    LIB_RX_LEN.store(d.data_size, Relaxed);
++    let rx_inten = RX_INTEN.load(Relaxed);
++    let short = unsafe { core::ptr::addr_of!(SHORT_TX.0) as u32 };
++    let pp = reg(0x4000_5510); // PACKETPTR
++    if rx_inten != 0 && reg(0x4000_5410) == 4 && pp >= short && pp < short + 2 * SHORT_TX_LEN as u32 {
++        unsafe { (0x4000_5304 as *mut u32).write_volatile(rx_inten) }; // INTENSET
++        trace(0xF6, d.data_size, pp); // RX left armed by the shortcut
++        return 0;
++    }
++    let ret = unsafe { nrfx_nfct_rx_impl(desc) };
++    if ret == 0 {
++        RX_INTEN.store(reg(0x4000_5300) & (1 << 5 | 1 << 6), Relaxed); // INTEN: RXFRAMESTART/END
++    }
++    // The NFCT stores the 2 CRC bytes in RAM and counts them against MAXLEN, but the library arms
++    // the RX for an S(WTX) reply with exactly 2 bytes -> the reply (f2 10 + CRC) is received with
++    // OVERRUN and dropped (seen on iPhone, nfc44: rx_status=0x8 size=2). Leave room for the CRC
++    // when the buffer is ours and has it.
++    if ret == 0 && !d.p_data.is_null() {
++        let buf = unsafe { core::ptr::addr_of_mut!(T4T_BUF.0) as usize };
++        let ptr = d.p_data as usize;
++        let want = d.data_size as usize + 2;
++        if ptr >= buf && ptr + want <= buf + 2 * T4T_BUFFER_SIZE + 128 && want <= 257 {
++            unsafe { (0x4000_5514 as *mut u32).write_volatile(want as u32) }; // MAXLEN
++        }
++    }
++    vtrace(tag::RX_RET, ret as u32, reg(0x4000_5514));
++    ret
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn nrfx_nfct_tx(desc: *const DataDesc, delay_mode: u8) -> i32 {
++    let d = unsafe { &*desc };
++    let first = if d.p_data.is_null() { 0 } else { unsafe { (d.p_data as *const u32).read_unaligned() } };
++    trace(tag::TX_CALL, d.data_size | (delay_mode as u32) << 24, first);
++    // MAXLEN is shared by TX and RX: nrfx sets it to the TX size. The reader answers short frames
++    // (S(WTX) -> f2 10 + CRC) right away, and if the library has not re-armed its RX buffer yet the
++    // answer lands in the TX buffer with MAXLEN 2 -> OVERRUN -> dropped -> the library later answers
++    // the reader's R(NAK) with a stale I-block and the phone deselects (seen on iPhone, nfc40).
++    // The library's WTX buffer is its own static, so send short frames from our buffer instead and
++    // leave 64 bytes of room; nrfx reports the actual buffer pointer with the received frame.
++    // Hardware shortcut TXFRAMEEND -> ENABLERXDATA: the reader answers within ~100 us of our
++    // frame, but the library only arms the RX (ENABLERXDATA) from the TXFRAMEEND interrupt, which
++    // is late while OpenSK computes (seen on iPhone, nfc46: TXS/TXE/RXS/RXE all pending in one
++    // interrupt, reply received with OVERRUN = no RX buffer armed). With the shortcut the reply is
++    // stored at PACKETPTR (our TX buffer, MAXLEN set below) and nrfx reports that pointer.
++    // Re-applied on every TX because nrfx may power-cycle the NFCT (errata 141).
++    unsafe { (0x4000_5200 as *mut u32).write_volatile(reg(0x4000_5200) | 1 << 5) }; // SHORTS
++    // Every frame is sent from our own double buffer, so a reply that the shortcut stores at
++    // PACKETPTR never overwrites the library's copy of its last block (needed for R(NAK) resends).
++    let ret = if !d.p_data.is_null() && d.data_size as usize <= SHORT_TX_LEN {
++        unsafe {
++            // Alternate between two buffers so a frame still being sent is never overwritten.
++            static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
++            let i = NEXT.fetch_xor(1, core::sync::atomic::Ordering::Relaxed) & 1;
++            let short = (core::ptr::addr_of_mut!(SHORT_TX.0) as *mut u8).add(i * SHORT_TX_LEN);
++            core::ptr::copy_nonoverlapping(d.p_data, short, d.data_size as usize);
++            let local = DataDesc { data_size: d.data_size, p_data: short };
++            let ret = nrfx_nfct_tx_impl(&local, delay_mode);
++            if ret == 0 {
++                (0x4000_5514 as *mut u32).write_volatile(257); // MAXLEN (hardware maximum)
++            }
++            ret
++        }
++    } else {
++        unsafe { nrfx_nfct_tx_impl(desc, delay_mode) }
++    };
++    if ret != 0 {
++        trace(tag::TX_RET, ret as u32, d.data_size);
++    } else {
++        vtrace(tag::TX_RET, ret as u32, 0);
++    }
++    ret
++}
++
++/// Error code returned by the Nordic library (negative errno).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct NfcError(pub i32);
++
++fn check(code: i32) -> Result<(), NfcError> {
++    if code == 0 { Ok(()) } else { Err(NfcError(code)) }
++}
++
++/// Registers the event callback (raw ISO-DEP mode). Must be called once before [`start`].
++///
++/// # Safety
++///
++/// The callback runs in the NFCT interrupt and must be safe to call from there.
++pub unsafe fn setup(callback: Callback) -> Result<(), NfcError> {
++    enable_cycle_counter();
++    trace(0xEE, 0x5E7, 0); // sanity entry: proves the trace path works
++    // No errata-57 analog pokes: they are nRF52832 engineering-A only (MDK system_nrf52.c) and
++    // nrfx applies nothing like it on the nRF52840. Power-cycle NFCT instead (as embassy-nrf does)
++    // to drop any state left by the bootloaders.
++    unsafe {
++        let power = 0x4000_5FFC as *mut u32;
++        power.write_volatile(0);
++        let _ = power.read_volatile();
++        power.write_volatile(1);
++    }
++    // Errata-57-style analog tuning of the NFCT load modulation, as the solo2 nRF52840 runner does
++    // (Nordic documents it for the nRF52832 only). The phone NAKs/loses our responses without it.
++    unsafe {
++        mark(0x9A, (0x4000_5610 as *const u32).read_volatile());
++        mark(0x9B, (0x4000_5614 as *const u32).read_volatile());
++        mark(0x9C, (0x4000_5618 as *const u32).read_volatile());
++        mark(0x9D, (0x4000_5688 as *const u32).read_volatile());
++        (0x4000_5004 as *mut u32).write_volatile(1); // NFCT TASKS_DISABLE
++        cortex_m::asm::delay(150);
++        (0x4000_5610 as *mut u32).write_volatile(0x0000_0005);
++        (0x4000_5614 as *mut u32).write_volatile(0x0000_003F);
++        (0x4000_5618 as *mut u32).write_volatile(0x0000_0000);
++        (0x4000_5688 as *mut u32).write_volatile(0x0000_0001);
++    }
++    // Interrupt priorities: everything defaults to 0, so NFCT could never preempt USBD/RTC/...
++    // Move all interrupts to priority 1; libnfc_t4t sets NFCT back to 0 below, TIMER0 (the NFCT
++    // errata-190 workaround timer) is set to 0 here.
++    unsafe {
++        let ipr = 0xE000_E400 as *mut u8;
++        // NFCT/TIMER0 at 1 (highest used), everything else at 2.
++        for n in 0 .. 48 {
++            ipr.add(n).write_volatile(2 << 5);
++        }
++        ipr.add(5).write_volatile(1 << 5); // NFCT
++        ipr.add(8).write_volatile(1 << 5); // TIMER0
++    }
++    check(unsafe { nfc_t4t_setup(callback, core::ptr::null_mut()) })?;
++    // 4-byte (single size) NFCID1, as in the solo2 runner: passing just the length selects a
++    // default-derived NFCID1 of that size.
++    const NFC_T4T_PARAM_NFCID1: u8 = 3;
++    let len: u8 = 4;
++    let _ = unsafe { nfc_t4t_parameter_set(NFC_T4T_PARAM_NFCID1, &len as *const u8 as *const _, 1) };
++    Ok(())
++}
++
++/// Sets the Frame Waiting time Integer advertised in the ATS (FWT = 256 * 16 / fc * 2^FWI;
++/// FWI 8 = about 77 ms per frame, the maximum allowed by NFC Forum). Call before [`start`].
++pub fn set_fwi(fwi: u8) -> Result<(), NfcError> {
++    const NFC_T4T_PARAM_FWI: u8 = 0;
++    check(unsafe { nfc_t4t_parameter_set(NFC_T4T_PARAM_FWI, &fwi as *const u8 as *const _, 1) })
++}
++
++/// Starts tag emulation (the NFCT peripheral starts sensing for a reader field).
++pub fn start() -> Result<(), NfcError> {
++    let r = unsafe { nfc_t4t_emulation_start() };
++    trace(0xE1, r as u32, reg(0x4000_5410) | reg(0x4000_5304) << 8);
++    check(r)
++}
++
++/// Stops tag emulation and powers the NFCT peripheral down.
++pub fn stop() -> Result<(), NfcError> {
++    let r = unsafe { nfc_t4t_emulation_stop() };
++    trace(0xE2, r as u32, 0);
++    check(r)
++}
++
++/// Sends a response PDU (the library fragments it into I-blocks).
++///
++/// # Safety
++///
++/// The buffer must stay valid and unchanged until `DATA_TRANSMITTED` or `FIELD_OFF`.
++pub unsafe fn send(pdu: *const u8, len: usize) -> Result<(), NfcError> {
++    check(unsafe { nfc_t4t_response_pdu_send(pdu, len) })
++}
++
++/// Must be called from the NFCT interrupt handler.
++/// Bring-up: if interrupts storm (an event that is never cleared starves everything at lower
++/// priority, including the RTC2 flush timer), persist the trace from the interrupt itself.
++fn check_storm() {
++    use core::sync::atomic::Ordering::Relaxed;
++    static STORM_FLUSHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++    let total = DIAG[5].load(Relaxed) + DIAG[6].load(Relaxed);
++    if total >= 1000 && !STORM_FLUSHED.swap(true, Relaxed) {
++        mark(0x92, 0x5707_0000 | (DIAG[5].load(Relaxed) & 0xffff));
++        mark(0x93, reg(0x4000_5304)); // NFCT INTEN
++        mark(0x94, reg(0x4000_8304)); // TIMER0 INTEN
++        mark(0x95, reg(0x4000_8140)); // TIMER0 EVENTS_COMPARE[0]
++        mark(0x96, reg(0xE000_ED04)); // SCB ICSR (VECTACTIVE / VECTPENDING)
++        flush_trace();
++    }
++}
++
++pub fn irq_nfct() {
++    diag_inc(5);
++    check_storm();
++    // RAM trace only (no flash writes here: ISO-DEP timing is a few hundred microseconds).
++    const EV: [usize; 13] = [
++        0x4000_5104, // FIELDDETECTED
++        0x4000_5108, // FIELDLOST
++        0x4000_5138, // AUTOCOLRESSTARTED
++        0x4000_5148, // COLLISION
++        0x4000_514C, // SELECTED
++        0x4000_5114, // RXFRAMESTART
++        0x4000_5118, // RXFRAMEEND
++        0x4000_5128, // RXERROR
++        0x4000_510C, // TXFRAMESTART
++        0x4000_511C, // ERROR
++        0x4000_5110, // TXFRAMEEND
++        0x4000_512C, // ENDRX
++        0x4000_5130, // ENDTX
++    ];
++    let mut mask = 0u32;
++    for (i, a) in EV.iter().enumerate() {
++        if reg(*a) != 0 {
++            mask |= 1 << i;
++        }
++    }
++    vtrace(tag::IRQ_BEFORE, mask | reg(0x4000_540C) << 16, reg(0x4000_5514) | reg(0x4000_5524) << 16);
++    unsafe { nrfx_nfct_irq_handler() }
++    vtrace(tag::IRQ_AFTER, reg(0x4000_5514), reg(0x4000_5510)); // MAXLEN, PACKETPTR
++}
++
++/// Must be called from the TIMER0 interrupt handler (NFCT errata workaround timer).
++pub fn irq_timer0() {
++    diag_inc(6);
++    check_storm();
++    vtrace(tag::TIMER0, reg(0x4000_8140), reg(0x4000_5410));
++    unsafe { nrfx_nfct_workaround_timer_handler() }
++}
++
++// ── nrfx glue (critical section, delay) ──────────────────────────────────────────────────────
++
++#[unsafe(no_mangle)]
++extern "C" fn nrfx_critical_section_enter() -> u8 {
++    let primask = cortex_m::register::primask::read();
++    cortex_m::interrupt::disable();
++    primask.is_active() as u8 // 1 = interrupts were enabled (PRIMASK clear)
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn nrfx_critical_section_exit(was_enabled: u8) {
++    if was_enabled != 0 {
++        unsafe { cortex_m::interrupt::enable() };
++    }
++}
++
++#[unsafe(no_mangle)]
++extern "C" fn nrfx_delay_us(us: u32) {
++    cortex_m::asm::delay(us.saturating_mul(64)); // 64 MHz core
++}
++
++// ── libnfc_t4t platform contract (nfc_platform.h) ────────────────────────────────────────────
++
++type ResolveFn = unsafe extern "C" fn(*const c_void, *const u8);
++
++static mut CB_RESOLVE: Option<ResolveFn> = None;
++
++/// One buffer pool for the library (FSD 256 + WTX frame, TX and RX halves), single-flighted.
++const T4T_BUFFER_SIZE: usize = 259;
++
++/// RX buffer the library asked for in its last `nrfx_nfct_rx` (frames received elsewhere are
++/// copied there before the library sees them).
++static LIB_RX_PTR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++static LIB_RX_LEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++/// INTEN bits nrfx enables for RX (learnt from the first normal `nrfx_nfct_rx_impl`).
++static RX_INTEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++
++const SHORT_TX_LEN: usize = 260; // room for a full 257-byte reply
++#[repr(C, align(4))]
++struct ShortBuf([u8; 2 * SHORT_TX_LEN]);
++/// TX buffer for short frames (S-blocks, R-blocks, ATS); doubles as RX room for the reply.
++static mut SHORT_TX: ShortBuf = ShortBuf([0; 2 * SHORT_TX_LEN]);
++#[repr(align(4))]
++// 2 x 259 bytes are used by the library (RX at 0, TX at 0x100, WTX at 0x200); the rest is slack
++// so a short TX can be followed by a reception into the same buffer (see `nrfx_nfct_tx`).
++struct AlignedBuf([u8; 2 * T4T_BUFFER_SIZE + 128]);
++static mut T4T_BUF: AlignedBuf = AlignedBuf([0; 2 * T4T_BUFFER_SIZE + 128]);
++static T4T_BUF_IN_USE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_setup(resolve: Option<ResolveFn>, irq_priority: *mut u8) -> i32 {
++    if resolve.is_none() || irq_priority.is_null() {
++        return -22; // -EINVAL
++    }
++    unsafe {
++        CB_RESOLVE = resolve;
++        // Highest priority: Wasefire's other interrupts must not delay ISO-DEP frame handling.
++        *irq_priority = 1; // above every other interrupt (they are all at 2)
++    }
++    0
++}
++
++/// NFCID1 derived from FICR.DEVICEADDR; byte 0 = 0x04 (NXP) so iOS treats it as a real tag.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_nfcid1_default_bytes_get(buf: *mut u8, len: u32) -> i32 {
++    if buf.is_null() {
++        return -22;
++    }
++    if len != 4 && len != 7 && len != 10 {
++        return -7; // -E2BIG
++    }
++    let ficr = 0x1000_0060 as *const u32;
++    let (a, b) = unsafe { (ficr.read_volatile(), ficr.add(1).read_volatile()) };
++    let bytes = [
++        0x04,
++        (a >> 24) as u8,
++        (a >> 16) as u8,
++        (a >> 8) as u8,
++        (b >> 24) as u8,
++        (b >> 16) as u8,
++        (b >> 8) as u8,
++        b as u8,
++        a as u8,
++        ((a >> 16) ^ (b >> 16)) as u8,
++    ];
++    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len as usize) };
++    0
++}
++
++/// nrfx NFCT events forwarded by the library: activate on field, restore FRAMEDELAYMAX on loss.
++///
++/// `nrfx_nfct_evt_t` starts with `nrfx_nfct_evt_id_t`, whose values are NFCT INTEN masks up to
++/// bit 20, so even as a packed enum it is 4 bytes wide.
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_event_handler(event: *const u32) {
++    const FIELD_DETECTED: u32 = 1 << 1; // NFCT_INTEN_FIELDDETECTED_Pos = 1
++    const FIELD_LOST: u32 = 1 << 2; // NFCT_INTEN_FIELDLOST_Pos = 2
++    const STATE_ACTIVATED: u8 = 0; // offsetof(NRF_NFCT_Type, TASKS_ACTIVATE)
++    const FRAMEDELAYMAX: *mut u32 = 0x4000_5508 as *mut u32;
++    let id = unsafe { event.read() };
++    diag_or(0, id);
++    // RX_FRAMEEND (0x40): log rx_status | size << 16 and the first frame bytes (event layout:
++    // id @0, rx_status @4, data_size @8, p_data @12).
++    if id == 0x40 {
++        let (st, size, mut p) = unsafe { (event.add(1).read(), event.add(2).read(), event.add(3).read()) };
++        // A frame stored in our TX buffer (shortcut-armed RX): the library only parses its own RX
++        // buffer, so copy the frame there and point the event at it.
++        let lib = LIB_RX_PTR.load(core::sync::atomic::Ordering::Relaxed);
++        if lib != 0 && p != 0 && p != lib {
++            let n = size.min(LIB_RX_LEN.load(core::sync::atomic::Ordering::Relaxed)) as usize;
++            unsafe {
++                core::ptr::copy(p as *const u8, lib as *mut u8, n);
++                (event.add(3) as *mut u32).write(lib);
++            }
++            trace(0xF7, p, n as u32);
++            p = lib;
++        }
++        let head = if p == 0 { 0 } else { unsafe { (p as *const u32).read_unaligned() } };
++        trace(tag::PLATFORM_EVT, id | st << 8 | size << 16, head); // every received frame
++        // RATS (E0 | FSDI << 4 | CID): cap the reader's FSD at 64 bytes (FSDI 5) before the library
++        // parses it, so it chains responses in short frames. Every failure seen on iPhone and
++        // Android came right after a full 254-byte I-block (the reader's next frame was received
++        // as garbage, then the field dropped), while frames up to ~83 bytes always worked.
++        if st == 0 && size == 2 && p != 0 && head & 0xFF == 0xE0 && (head >> 8 & 0xFF) >> 4 > 5 {
++            unsafe { (p as *mut u8).add(1).write_volatile(0x50 | (head >> 8 & 0x0F) as u8) };
++            trace(0xF5, head, 0x50);
++        }
++    } else {
++        if id == 0x2 || id == 0x4 {
++            trace(tag::PLATFORM_EVT, id, reg(0x4000_040C)); // field detected / lost
++        } else {
++            vtrace(tag::PLATFORM_EVT, id, reg(0x4000_040C));
++        }
++    }
++    match id {
++        FIELD_DETECTED => {
++            // nrfx just cleared and started TIMER0 for the errata-190 activation delay. Drop any
++            // stale COMPARE event / pending interrupt so ACTIVATE really happens >= 1 ms later.
++            unsafe {
++                (0x4000_800C as *mut u32).write_volatile(1); // TIMER0 TASKS_CLEAR
++                (0x4000_8140 as *mut u32).write_volatile(0); // TIMER0 EVENTS_COMPARE[0]
++                (0xE000_E280 as *mut u32).write_volatile(1 << 8); // NVIC ICPR0: TIMER0
++            }
++            unsafe { nrfx_nfct_state_force(STATE_ACTIVATED) };
++            diag_inc(1);
++            let tagstate = unsafe { (0x4000_5410 as *const u32).read_volatile() };
++            DIAG[3].store(tagstate, core::sync::atomic::Ordering::Relaxed);
++        }
++        FIELD_LOST => unsafe { FRAMEDELAYMAX.write_volatile(0x1000) },
++        _ => (),
++    }
++}
++
++/// Deferred library callbacks: run them right away (we are already in the NFCT interrupt).
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_cb_request(
++    ctx: *const c_void, _ctx_len: usize, data: *const u8, _data_len: usize, _copy: bool,
++) {
++    diag_inc(2);
++    vtrace(tag::CB_REQUEST, ctx as u32, data as u32);
++    if let Some(resolve) = unsafe { CB_RESOLVE } {
++        unsafe { resolve(ctx, data) };
++    }
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_buffer_alloc(size: usize) -> *mut u8 {
++    use core::sync::atomic::Ordering::SeqCst;
++    // Same semantics as Nordic's NCS platform.c: always the same static buffer, no ownership.
++    let _ = &T4T_BUF_IN_USE;
++    let _ = SeqCst;
++    if size > 2 * T4T_BUFFER_SIZE {
++        diag_inc(4);
++        return core::ptr::null_mut();
++    }
++    unsafe { core::ptr::addr_of_mut!(T4T_BUF.0) as *mut u8 }
++}
++
++#[unsafe(no_mangle)]
++unsafe extern "C" fn nfc_platform_buffer_free(buf: *mut u8) {
++    if buf == unsafe { core::ptr::addr_of_mut!(T4T_BUF.0) as *mut u8 } {
++        T4T_BUF_IN_USE.store(false, core::sync::atomic::Ordering::SeqCst);
++    }
++}
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/README.md b/crates/runner-nordic/crates/nrf-nfc/vendor/README.md
+new file mode 100644
+index 0000000..3dedf09
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/README.md
+@@ -0,0 +1,8 @@
++# NFC libraries (downloaded or built by the installer)
++
++Nothing in this directory comes from this repository except the build helpers. `install.sh` fills it:
++
++| File | Source |
++|---|---|
++| `lib/libnfc_t4t.a`, `include/*.h`, `license.txt` | Nordic Type 4 Tag library from [nrfconnect/sdk-nrfxlib](https://github.com/nrfconnect/sdk-nrfxlib) @ 529012899ffb2aa8ef69cbbb315eaf2848737aca (downloaded, SHA-256 checked). Nordic license: only for use with Nordic Semiconductor ICs. |
++| `lib/libnrfx_nfct.a` | Built by `nrfx-build/build-nrfx.sh` from [NordicSemiconductor/nrfx](https://github.com/NordicSemiconductor/nrfx) v4.2.1 with `nrfx-build/nrfx_nfct-techo.patch`. |
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/build-nrfx.sh b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/build-nrfx.sh
+new file mode 100755
+index 0000000..cf73672
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/build-nrfx.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++# Rebuilds ../lib/libnrfx_nfct.a (nrfx NFCT + TIMER drivers, BSD-3-Clause) for thumbv7em-none-eabi
++# soft-float. Needs clang (Apple or LLVM), git and llvm-ar (`rustup component add llvm-tools`).
++# Run by the installer (nothing from nrfx is shipped in this repository).
++set -e
++cd "$(dirname "$0")"
++[ -d nrfx ] || git -c advice.detachedHead=false clone -q --depth 1 --branch v4.2.1 https://github.com/NordicSemiconductor/nrfx.git nrfx
++if [ ! -d cmsis ]; then
++  git init -q cmsis && git -C cmsis fetch -q --depth 1 https://github.com/ARM-software/CMSIS_6.git f6226079fdb207e945dae7cea2c273ea5200376a
++  git -C cmsis checkout -q FETCH_HEAD
++fi
++# Patch: report TX events before RX events when the interrupt is serviced late (see the patch).
++git -C nrfx apply --check ../nrfx_nfct-techo.patch 2>/dev/null && git -C nrfx apply ../nrfx_nfct-techo.patch
++CMSIS_INC=cmsis/CMSIS/Core/Include
++INC=(-Iglue -Ilibc -I$CMSIS_INC -Inrfx/drivers/include -Inrfx/hal -Inrfx/haly -Inrfx/helpers
++     -Inrfx/templates -Inrfx/bsp/stable -Inrfx/bsp/stable/mdk -Inrfx/bsp/stable/soc
++     -Inrfx/bsp/stable/soc/irqs -Inrfx/bsp/stable/soc/interconnect -Inrfx/bsp/stable/templates -Inrfx)
++CC=${CC:-clang}
++for src in nrfx_nfct nrfx_timer; do
++  $CC --target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -mfloat-abi=soft -fshort-enums -ffreestanding \
++    -fno-builtin -fno-strict-aliasing -ffunction-sections -fdata-sections -O2 \
++    -DNRF52840_XXAA -Dnrfx_nfct_rx=nrfx_nfct_rx_impl -Dnrfx_nfct_tx=nrfx_nfct_tx_impl \
++    -D__HEAP_SIZE=0 -D__STACK_SIZE=0 -Wno-unused-parameter -Wno-expansion-to-defined \
++    "${INC[@]}" -c -o $src.o nrfx/drivers/src/$src.c
++done
++AR=${AR:-$(find "$(rustc --print sysroot)" -name llvm-ar | head -1)}
++rm -f ../lib/libnrfx_nfct.a && "$AR" rcs ../lib/libnrfx_nfct.a nrfx_nfct.o nrfx_timer.o
++echo "built ../lib/libnrfx_nfct.a"
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_config.h b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_config.h
+new file mode 100644
+index 0000000..bd262bd
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_config.h
+@@ -0,0 +1,18 @@
++#ifndef NRFX_CONFIG_H__
++#define NRFX_CONFIG_H__
++#ifndef NRF52840_XXAA
++#define NRF52840_XXAA
++#endif
++#define NRFX_NFCT_ENABLED                       1
++#define NRFX_NFCT_CONFIG_TIMER_INSTANCE_ID      0
++#define NRFX_NFCT_CONFIG_IRQ_PRIORITY           6
++#define NRFX_NFCT_CONFIG_LOG_ENABLED            0
++#define NRFX_TIMER_ENABLED                      1
++#define NRFX_TIMER0_ENABLED                     1
++#define NRFX_TIMER_DEFAULT_CONFIG_FREQUENCY     0
++#define NRFX_TIMER_DEFAULT_CONFIG_MODE          0
++#define NRFX_TIMER_DEFAULT_CONFIG_BIT_WIDTH     0
++#define NRFX_TIMER_DEFAULT_CONFIG_IRQ_PRIORITY  6
++#define NRFX_TIMER_CONFIG_LOG_ENABLED           0
++#include <nrfx_config_common.h>
++#endif
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_glue.h b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_glue.h
+new file mode 100644
+index 0000000..15a20ca
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_glue.h
+@@ -0,0 +1,38 @@
++#ifndef NRFX_GLUE_H__
++#define NRFX_GLUE_H__
++#include <nrfx.h>
++#define NRFX_ASSERT(e)                  ((void)(e))
++#define NRFX_STATIC_ASSERT(e)           _Static_assert(e, #e)
++#define NRFX_IRQ_PRIORITY_SET(i, p)     NVIC_SetPriority((IRQn_Type)(i), p)
++#define NRFX_IRQ_ENABLE(i)              NVIC_EnableIRQ((IRQn_Type)(i))
++#define NRFX_IRQ_IS_ENABLED(i)          (NVIC_GetEnableIRQ((IRQn_Type)(i)) != 0)
++#define NRFX_IRQ_DISABLE(i)             NVIC_DisableIRQ((IRQn_Type)(i))
++#define NRFX_IRQ_PENDING_SET(i)         NVIC_SetPendingIRQ((IRQn_Type)(i))
++#define NRFX_IRQ_PENDING_CLEAR(i)       NVIC_ClearPendingIRQ((IRQn_Type)(i))
++#define NRFX_IRQ_IS_PENDING(i)          (NVIC_GetPendingIRQ((IRQn_Type)(i)) != 0)
++extern uint8_t nrfx_critical_section_enter(void);
++extern void    nrfx_critical_section_exit(uint8_t saved);
++#define NRFX_CRITICAL_SECTION_ENTER()   { uint8_t _nrfx_cs = nrfx_critical_section_enter();
++#define NRFX_CRITICAL_SECTION_EXIT()      nrfx_critical_section_exit(_nrfx_cs); }
++extern void nrfx_delay_us(uint32_t us);
++#define NRFX_DELAY_US(us)               nrfx_delay_us(us)
++#define NRFX_ATOMIC_FETCH_STORE(p, v)   __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_FETCH_OR(p, v)      __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_FETCH_AND(p, v)     __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_FETCH_XOR(p, v)     __atomic_fetch_xor(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_FETCH_ADD(p, v)     __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_FETCH_SUB(p, v)     __atomic_fetch_sub(p, v, __ATOMIC_SEQ_CST)
++#define NRFX_ATOMIC_CAS(p, ov, nv) ({ __typeof__(ov) _o = (ov); __atomic_compare_exchange_n(p, &_o, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); })
++#define NRFX_CLZ(v)                     __builtin_clz(v)
++#define NRFX_CTZ(v)                     __builtin_ctz(v)
++#define NRFX_POPCOUNT(v)                __builtin_popcount(v)
++#define NRFX_EVENT_READBACK_ENABLED     1
++#define NRFX_DPPI_CHANNELS_USED         0
++#define NRFX_DPPI_GROUPS_USED           0
++#define NRFX_PPI_CHANNELS_USED          0
++#define NRFX_PPI_GROUPS_USED            0
++#define NRFX_GPIOTE_CHANNELS_USED       0
++#define NRFX_EGUS_USED                  0
++#define NRFX_TIMERS_USED                0
++#define NRFX_CUSTOM_ERROR_CODES         0
++#endif
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_log.h b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_log.h
+new file mode 100644
+index 0000000..9be40dd
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/glue/nrfx_log.h
+@@ -0,0 +1,12 @@
++#ifndef NRFX_LOG_H__
++#define NRFX_LOG_H__
++#define NRFX_LOG_INFO(...)              ((void)0)
++#define NRFX_LOG_WARNING(...)           ((void)0)
++#define NRFX_LOG_ERROR(...)             ((void)0)
++#define NRFX_LOG_DEBUG(...)             ((void)0)
++#define NRFX_LOG_HEXDUMP_INFO(p, len)   ((void)0)
++#define NRFX_LOG_HEXDUMP_WARNING(p,len) ((void)0)
++#define NRFX_LOG_HEXDUMP_ERROR(p, len)  ((void)0)
++#define NRFX_LOG_HEXDUMP_DEBUG(p, len)  ((void)0)
++#define NRFX_LOG_ERROR_STRING_GET(c)    ""
++#endif
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/errno.h b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/errno.h
+new file mode 100644
+index 0000000..ff9cee1
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/errno.h
+@@ -0,0 +1,23 @@
++/* Minimal errno.h for building nrfx freestanding (values match newlib). */
++#ifndef NRFX_FREESTANDING_ERRNO_H
++#define NRFX_FREESTANDING_ERRNO_H
++#define EPERM 1
++#define ENOENT 2
++#define EIO 5
++#define ENXIO 6
++#define E2BIG 7
++#define EAGAIN 11
++#define ENOMEM 12
++#define EACCES 13
++#define EFAULT 14
++#define EBUSY 16
++#define EEXIST 17
++#define ENODEV 19
++#define EINVAL 22
++#define ENOSPC 28
++#define ENOTSUP 134
++#define ETIMEDOUT 116
++#define EINPROGRESS 119
++#define EALREADY 120
++#define ECANCELED 140
++#endif
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/string.h b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/string.h
+new file mode 100644
+index 0000000..62d3467
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/libc/string.h
+@@ -0,0 +1,10 @@
++/* Minimal string.h for building nrfx freestanding (implementations come from Rust's compiler_builtins). */
++#ifndef NRFX_FREESTANDING_STRING_H
++#define NRFX_FREESTANDING_STRING_H
++#include <stddef.h>
++void *memcpy(void *dst, const void *src, size_t n);
++void *memmove(void *dst, const void *src, size_t n);
++void *memset(void *dst, int c, size_t n);
++int memcmp(const void *a, const void *b, size_t n);
++size_t strlen(const char *s);
++#endif
+diff --git a/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/nrfx_nfct-techo.patch b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/nrfx_nfct-techo.patch
+new file mode 100644
+index 0000000..5e8b5f6
+--- /dev/null
++++ b/crates/runner-nordic/crates/nrf-nfc/vendor/nrfx-build/nrfx_nfct-techo.patch
+@@ -0,0 +1,95 @@
++--- a/drivers/src/nrfx_nfct.c
+++++ b/drivers/src/nrfx_nfct.c
++@@ -1001,6 +1001,44 @@
++     if (current_field != NRFX_NFC_FIELD_STATE_NONE)
++     {
++         nfct_field_event_handler(current_field);
+++    }
+++
+++    /* techo patch: when the interrupt is serviced late, our TX (e.g. S(WTX)) and the reader's
+++       answer can both be pending. Report them in the order they happened (TX first), otherwise
+++       the library sees the answer before its own TX end and ignores it. The answer was stored
+++       at the buffer armed by the TXFRAMEEND->ENABLERXDATA shortcut, so capture its pointer and
+++       length before the TX handler re-arms the RX buffer. */
+++    uint8_t * techo_rx_ptr  = nrfy_nfct_rxtx_buffer_get(NRF_NFCT);
+++    uint32_t  techo_rx_size = NRFX_NFCT_BITS_TO_BYTES(nrfy_nfct_rx_bits_get(NRF_NFCT, true));
+++
+++    if (NRFX_NFCT_EVT_ACTIVE(TXFRAMESTART, evt_mask))
+++    {
+++        if (m_nfct_cb.config.cb != NULL)
+++        {
+++            nrfx_nfct_evt_t nfct_evt;
+++
+++            nfct_evt.evt_id                                 = NRFX_NFCT_EVT_TX_FRAMESTART;
+++            nfct_evt.params.tx_framestart.tx_data.p_data    = nrfy_nfct_rxtx_buffer_get(NRF_NFCT);
+++            nfct_evt.params.tx_framestart.tx_data.data_size =
+++                NRFX_NFCT_BITS_TO_BYTES(nrfy_nfct_tx_bits_get(NRF_NFCT));
+++
+++            m_nfct_cb.config.cb(&nfct_evt);
+++        }
+++    }
+++
+++    if (NRFX_NFCT_EVT_ACTIVE(TXFRAMEEND, evt_mask))
+++    {
+++        nrfx_nfct_evt_t nfct_evt =
+++        {
+++            .evt_id = NRFX_NFCT_EVT_TX_FRAMEEND
+++        };
+++
+++        /* Ignore any frame transmission until a new TX is scheduled by nrfx_nfct_tx() */
+++        nrfy_nfct_int_disable(NRF_NFCT, NRFX_NFCT_TX_INT_MASK);
+++
+++        NRFX_NFCT_CB_HANDLE(m_nfct_cb.config.cb, nfct_evt);
+++
+++        NRFX_LOG_DEBUG("Tx fend");
++     }
++ 
++     if (NRFX_NFCT_EVT_ACTIVE(RXFRAMESTART, evt_mask))
++@@ -1022,9 +1060,8 @@
++ 
++         /* Take into account only the number of whole bytes. */
++         nfct_evt.params.rx_frameend.rx_status         = 0;
++-        nfct_evt.params.rx_frameend.rx_data.p_data    = nrfy_nfct_rxtx_buffer_get(NRF_NFCT);
++-        nfct_evt.params.rx_frameend.rx_data.data_size =
++-            NRFX_NFCT_BITS_TO_BYTES(nrfy_nfct_rx_bits_get(NRF_NFCT, true));
+++        nfct_evt.params.rx_frameend.rx_data.p_data    = techo_rx_ptr;
+++        nfct_evt.params.rx_frameend.rx_data.data_size = techo_rx_size;
++ 
++         if (nrfy_nfct_event_check(NRF_NFCT, NRF_NFCT_EVENT_RXERROR))
++         {
++@@ -1097,35 +1134,6 @@
++         nrfy_nfct_error_status_clear(NRF_NFCT, m_status_all_msk);
++     }
++ 
++-    if (NRFX_NFCT_EVT_ACTIVE(TXFRAMESTART, evt_mask))
++-    {
++-        if (m_nfct_cb.config.cb != NULL)
++-        {
++-            nrfx_nfct_evt_t nfct_evt;
++-
++-            nfct_evt.evt_id                                 = NRFX_NFCT_EVT_TX_FRAMESTART;
++-            nfct_evt.params.tx_framestart.tx_data.p_data    = nrfy_nfct_rxtx_buffer_get(NRF_NFCT);
++-            nfct_evt.params.tx_framestart.tx_data.data_size =
++-                NRFX_NFCT_BITS_TO_BYTES(nrfy_nfct_tx_bits_get(NRF_NFCT));
++-
++-            m_nfct_cb.config.cb(&nfct_evt);
++-        }
++-    }
++-
++-    if (NRFX_NFCT_EVT_ACTIVE(TXFRAMEEND, evt_mask))
++-    {
++-        nrfx_nfct_evt_t nfct_evt =
++-        {
++-            .evt_id = NRFX_NFCT_EVT_TX_FRAMEEND
++-        };
++-
++-        /* Ignore any frame transmission until a new TX is scheduled by nrfx_nfct_tx() */
++-        nrfy_nfct_int_disable(NRF_NFCT, NRFX_NFCT_TX_INT_MASK);
++-
++-        NRFX_NFCT_CB_HANDLE(m_nfct_cb.config.cb, nfct_evt);
++-
++-        NRFX_LOG_DEBUG("Tx fend");
++-    }
++ }
++ 
++ #if NRF_ERRATA_STATIC_CHECK(52, 79) || NRF_ERRATA_STATIC_CHECK(52, 190) || \
+diff --git a/crates/runner-nordic/crates/p256-cm4/Cargo.toml b/crates/runner-nordic/crates/p256-cm4/Cargo.toml
+new file mode 100644
+index 0000000..af5acac
+--- /dev/null
++++ b/crates/runner-nordic/crates/p256-cm4/Cargo.toml
+@@ -0,0 +1,7 @@
++[package]
++name = "p256-cm4"
++version = "0.1.0"
++edition = "2024"
++license = "MIT"
++links = "p256_cm4"
++description = "Bindings to Emil Lenngren's P256-Cortex-M4 (fast constant-time P-256 ECDH/ECDSA)"
+diff --git a/crates/runner-nordic/crates/p256-cm4/build.rs b/crates/runner-nordic/crates/p256-cm4/build.rs
+new file mode 100644
+index 0000000..9c0f4e0
+--- /dev/null
++++ b/crates/runner-nordic/crates/p256-cm4/build.rs
+@@ -0,0 +1,6 @@
++fn main() {
++    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/lib");
++    println!("cargo::rustc-link-search=native={}", dir.display());
++    println!("cargo::rustc-link-lib=static=p256_cm4");
++    println!("cargo::rerun-if-changed=vendor/lib/libp256_cm4.a");
++}
+diff --git a/crates/runner-nordic/crates/p256-cm4/src/lib.rs b/crates/runner-nordic/crates/p256-cm4/src/lib.rs
+new file mode 100644
+index 0000000..5ad8db5
+--- /dev/null
++++ b/crates/runner-nordic/crates/p256-cm4/src/lib.rs
+@@ -0,0 +1,29 @@
++//! FFI to P256-Cortex-M4 (MIT). Scalars and coordinates are `[u32; 8]` little-endian words
++//! (word 0 is the least significant), 4-byte aligned.
++#![no_std]
++
++unsafe extern "C" {
++    pub fn p256_keygen(x: *mut u32, y: *mut u32, private_key: *const u32) -> bool;
++    pub fn p256_sign(
++        r: *mut u32, s: *mut u32, hash: *const u8, hash_len: u32, private_key: *const u32,
++        k: *const u32,
++    ) -> bool;
++    pub fn p256_verify(
++        x: *const u32, y: *const u32, hash: *const u8, hash_len: u32, r: *const u32, s: *const u32,
++    ) -> bool;
++    pub fn p256_ecdh_calc_shared_secret(
++        shared: *mut u8, private_key: *const u32, x: *const u32, y: *const u32,
++    ) -> bool;
++}
++
++/// Big-endian 32 bytes to little-endian words.
++pub fn words(b: &[u8]) -> [u32; 8] {
++    core::array::from_fn(|i| u32::from_be_bytes(b[28 - 4 * i .. 32 - 4 * i].try_into().unwrap()))
++}
++
++/// Little-endian words to big-endian 32 bytes.
++pub fn bytes(w: &[u32; 8], out: &mut [u8]) {
++    for (i, x) in w.iter().enumerate() {
++        out[28 - 4 * i .. 32 - 4 * i].copy_from_slice(&x.to_be_bytes());
++    }
++}
+diff --git a/crates/runner-nordic/crates/p256-cm4/vendor/build.sh b/crates/runner-nordic/crates/p256-cm4/vendor/build.sh
+new file mode 100755
+index 0000000..6ea972d
+--- /dev/null
++++ b/crates/runner-nordic/crates/p256-cm4/vendor/build.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++# Builds lib/libp256_cm4.a from Emil Lenngren's P256-Cortex-M4 C sources (downloaded into this
++# directory by the installer) for thumbv7em-none-eabi soft-float. Needs clang and llvm-ar.
++set -euo pipefail
++cd "$(dirname "$0")"
++CC=${CC:-clang}
++CFLAGS=(--target=thumbv7em-none-eabi -mthumb -mcpu=cortex-m4 -mfloat-abi=soft -std=c11 -ffreestanding
++        -ffunction-sections -fdata-sections -O2 -Ilibc -I.)
++mkdir -p build lib
++$CC "${CFLAGS[@]}" -c p256-cortex-m4.c -o build/p256-cortex-m4.o
++$CC "${CFLAGS[@]}" -c p256-cortex-m4-asm-gcc.S -o build/p256-cortex-m4-asm.o
++AR=${AR:-$(find "$(rustc --print sysroot)" -name llvm-ar | head -1)}
++rm -f lib/libp256_cm4.a
++"$AR" rcs lib/libp256_cm4.a build/p256-cortex-m4.o build/p256-cortex-m4-asm.o
++echo "built lib/libp256_cm4.a"
+diff --git a/crates/runner-nordic/crates/p256-cm4/vendor/libc/string.h b/crates/runner-nordic/crates/p256-cm4/vendor/libc/string.h
+new file mode 100644
+index 0000000..094cf7f
+--- /dev/null
++++ b/crates/runner-nordic/crates/p256-cm4/vendor/libc/string.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include <stddef.h>
++void *memcpy(void *, const void *, size_t);
++void *memset(void *, int, size_t);
++int memcmp(const void *, const void *, size_t);
+diff --git a/crates/runner-nordic/src/board/button.rs b/crates/runner-nordic/src/board/button.rs
+index 0213752..1e977b0 100644
+--- a/crates/runner-nordic/src/board/button.rs
++++ b/crates/runner-nordic/src/board/button.rs
+@@ -25,7 +25,7 @@ pub enum Impl {}
+ impl Support<usize> for Impl {
+     #[cfg(feature = "board-devkit")]
+     const SUPPORT: usize = 4;
+-    #[cfg(any(feature = "board-dongle", feature = "board-makerdiary"))]
++    #[cfg(any(feature = "board-dongle", feature = "board-makerdiary", feature = "board-techo"))]
+     const SUPPORT: usize = 1;
+ }
+ 
+diff --git a/crates/runner-nordic/src/board/crypto.rs b/crates/runner-nordic/src/board/crypto.rs
+index 351d81b..e93036f 100644
+--- a/crates/runner-nordic/src/board/crypto.rs
++++ b/crates/runner-nordic/src/board/crypto.rs
+@@ -16,6 +16,8 @@ use wasefire_board_api::crypto;
+ 
+ #[cfg(feature = "aes128-ccm")]
+ mod ccm;
++#[cfg(feature = "p256-cm4")]
++mod p256_cm4;
+ 
+ pub enum Impl {}
+ 
+@@ -30,6 +32,10 @@ impl crypto::Api for Impl {
+     type HmacSha256 = crypto::SoftwareHmacSha256<Self>;
+     #[cfg(feature = "software-crypto-p256")]
+     type P256 = crypto::SoftwareP256<Self>;
++    #[cfg(feature = "p256-cm4")]
++    type P256Ecdh = p256_cm4::Impl;
++    #[cfg(feature = "p256-cm4")]
++    type P256Ecdsa = p256_cm4::Impl;
+     #[cfg(feature = "software-crypto-p256-ecdh")]
+     type P256Ecdh = crypto::SoftwareP256Ecdh<crypto::CryptoRng<crate::Board>>;
+     #[cfg(feature = "software-crypto-p256-ecdsa")]
+diff --git a/crates/runner-nordic/src/board/crypto/p256_cm4.rs b/crates/runner-nordic/src/board/crypto/p256_cm4.rs
+new file mode 100644
+index 0000000..31d128e
+--- /dev/null
++++ b/crates/runner-nordic/src/board/crypto/p256_cm4.rs
+@@ -0,0 +1,222 @@
++// P-256 ECDH and ECDSA with Emil Lenngren's P256-Cortex-M4 (MIT, constant time, ~5-15 ms per
++// operation at 64 MHz instead of ~130 ms with the generic software implementation). Same key
++// formats as the software implementation: 32-byte big-endian scalar, 64-byte big-endian x || y.
++
++use core::alloc::Layout;
++
++use p256_cm4::{bytes, words};
++use wasefire_board_api::crypto::{ecdh, ecdsa};
++use wasefire_board_api::rng::Api as _;
++use wasefire_board_api::Supported;
++use wasefire_error::{Code, Error};
++
++pub enum Impl {}
++
++impl Supported for Impl {}
++
++const N: usize = 32;
++
++fn fill(buf: &mut [u8]) -> Result<(), Error> {
++    wasefire_board_api::Rng::<crate::Board>::fill_bytes(buf)
++}
++
++fn zeroize(buf: &mut [u8]) {
++    for x in buf.iter_mut() {
++        unsafe { core::ptr::write_volatile(x, 0) };
++    }
++}
++
++fn generate(private: &mut [u8]) -> Result<(), Error> {
++    if private.len() != N {
++        return Err(Error::user(Code::InvalidLength));
++    }
++    loop {
++        fill(private)?;
++        let (mut x, mut y) = ([0u32; 8], [0u32; 8]);
++        // Fails only when the scalar is not in [1, n-1].
++        if unsafe { p256_cm4::p256_keygen(x.as_mut_ptr(), y.as_mut_ptr(), words(private).as_ptr()) } {
++            return Ok(());
++        }
++    }
++}
++
++fn public(private: &[u8], public: &mut [u8]) -> Result<(), Error> {
++    if private.len() != N || public.len() != 2 * N {
++        return Err(Error::user(Code::InvalidLength));
++    }
++    let (mut x, mut y) = ([0u32; 8], [0u32; 8]);
++    if !unsafe { p256_cm4::p256_keygen(x.as_mut_ptr(), y.as_mut_ptr(), words(private).as_ptr()) } {
++        return Err(Error::user(Code::InvalidArgument));
++    }
++    let (px, py) = public.split_at_mut(N);
++    bytes(&x, px);
++    bytes(&y, py);
++    Ok(())
++}
++
++fn split(public: &[u8]) -> Result<([u32; 8], [u32; 8]), Error> {
++    if public.len() != 2 * N {
++        return Err(Error::user(Code::InvalidLength));
++    }
++    let (x, y) = public.split_at(N);
++    Ok((words(x), words(y)))
++}
++
++fn export_public(public: &[u8], x: &mut [u8; N], y: &mut [u8; N]) -> Result<(), Error> {
++    if public.len() != 2 * N {
++        return Err(Error::user(Code::InvalidLength));
++    }
++    let (px, py) = public.split_at(N);
++    x.copy_from_slice(px);
++    y.copy_from_slice(py);
++    Ok(())
++}
++
++fn import_public(x: &[u8; N], y: &[u8; N], public: &mut [u8]) -> Result<(), Error> {
++    if public.len() != 2 * N {
++        return Err(Error::user(Code::InvalidLength));
++    }
++    let (px, py) = public.split_at_mut(N);
++    px.copy_from_slice(x);
++    py.copy_from_slice(y);
++    Ok(())
++}
++
++impl ecdh::Api<32> for Impl {
++    const PRIVATE: Layout = unsafe { Layout::from_size_align_unchecked(N, 1) };
++    const PUBLIC: Layout = unsafe { Layout::from_size_align_unchecked(2 * N, 1) };
++    const SHARED: Layout = unsafe { Layout::from_size_align_unchecked(N, 1) };
++
++    fn generate(private: &mut [u8]) -> Result<(), Error> {
++        generate(private)
++    }
++
++    fn public(private: &[u8], public_: &mut [u8]) -> Result<(), Error> {
++        public(private, public_)
++    }
++
++    fn shared(private: &[u8], public: &[u8], shared: &mut [u8]) -> Result<(), Error> {
++        if private.len() != N || shared.len() != N {
++            return Err(Error::user(Code::InvalidLength));
++        }
++        let (x, y) = split(public)?;
++        let d = words(private);
++        // Fails when the peer's point is not on the curve.
++        if !unsafe {
++            p256_cm4::p256_ecdh_calc_shared_secret(shared.as_mut_ptr(), d.as_ptr(), x.as_ptr(), y.as_ptr())
++        } {
++            return Err(Error::user(Code::InvalidArgument));
++        }
++        Ok(())
++    }
++
++    fn drop_private(private: &mut [u8]) -> Result<(), Error> {
++        zeroize(private);
++        Ok(())
++    }
++
++    fn drop_shared(shared: &mut [u8]) -> Result<(), Error> {
++        zeroize(shared);
++        Ok(())
++    }
++
++    fn export_public(public: &[u8], x: &mut [u8; N], y: &mut [u8; N]) -> Result<(), Error> {
++        export_public(public, x, y)
++    }
++
++    fn import_public(x: &[u8; N], y: &[u8; N], public: &mut [u8]) -> Result<(), Error> {
++        import_public(x, y, public)
++    }
++
++    fn export_shared(shared: &[u8], x: &mut [u8; N]) -> Result<(), Error> {
++        if shared.len() != N {
++            return Err(Error::user(Code::InvalidLength));
++        }
++        x.copy_from_slice(shared);
++        Ok(())
++    }
++}
++
++impl ecdsa::Api<32> for Impl {
++    const PRIVATE: Layout = unsafe { Layout::from_size_align_unchecked(N, 1) };
++    const PUBLIC: Layout = unsafe { Layout::from_size_align_unchecked(2 * N, 1) };
++    const WRAPPED: usize = N;
++
++    fn generate(private: &mut [u8]) -> Result<(), Error> {
++        generate(private)
++    }
++
++    fn public(private: &[u8], public_: &mut [u8]) -> Result<(), Error> {
++        public(private, public_)
++    }
++
++    fn sign(private: &[u8], digest: &[u8; N], r: &mut [u8; N], s: &mut [u8; N]) -> Result<(), Error> {
++        if private.len() != N {
++            return Err(Error::user(Code::InvalidLength));
++        }
++        let d = words(private);
++        let mut k = [0u8; N];
++        let result = loop {
++            fill(&mut k)?;
++            let (mut rw, mut sw) = ([0u32; 8], [0u32; 8]);
++            // Fails with probability ~2^-32 (or for an invalid private key): retry with a new k.
++            let ok = unsafe {
++                p256_cm4::p256_sign(
++                    rw.as_mut_ptr(), sw.as_mut_ptr(), digest.as_ptr(), N as u32, d.as_ptr(),
++                    words(&k).as_ptr(),
++                )
++            };
++            if ok {
++                bytes(&rw, r);
++                bytes(&sw, s);
++                break Ok(());
++            }
++            // An invalid private key fails for every k.
++            let (mut x, mut y) = ([0u32; 8], [0u32; 8]);
++            if !unsafe { p256_cm4::p256_keygen(x.as_mut_ptr(), y.as_mut_ptr(), d.as_ptr()) } {
++                break Err(Error::user(Code::InvalidArgument));
++            }
++        };
++        zeroize(&mut k);
++        result
++    }
++
++    fn verify(public: &[u8], digest: &[u8; N], r: &[u8; N], s: &[u8; N]) -> Result<bool, Error> {
++        let (x, y) = split(public)?;
++        Ok(unsafe {
++            p256_cm4::p256_verify(
++                x.as_ptr(), y.as_ptr(), digest.as_ptr(), N as u32, words(r).as_ptr(),
++                words(s).as_ptr(),
++            )
++        })
++    }
++
++    fn drop_private(private: &mut [u8]) -> Result<(), Error> {
++        zeroize(private);
++        Ok(())
++    }
++
++    fn export_private(private: &[u8], wrapped: &mut [u8]) -> Result<(), Error> {
++        if private.len() != N || wrapped.len() != N {
++            return Err(Error::user(Code::InvalidLength));
++        }
++        wrapped.copy_from_slice(private);
++        Ok(())
++    }
++
++    fn import_private(wrapped: &[u8], private: &mut [u8]) -> Result<(), Error> {
++        if wrapped.len() != N || private.len() != N {
++            return Err(Error::user(Code::InvalidLength));
++        }
++        private.copy_from_slice(wrapped);
++        Ok(())
++    }
++
++    fn export_public(public: &[u8], x: &mut [u8; N], y: &mut [u8; N]) -> Result<(), Error> {
++        export_public(public, x, y)
++    }
++
++    fn import_public(x: &[u8; N], y: &[u8; N], public: &mut [u8]) -> Result<(), Error> {
++        import_public(x, y, public)
++    }
++}
+diff --git a/crates/runner-nordic/src/board/led.rs b/crates/runner-nordic/src/board/led.rs
+index 059a912..849b7cc 100644
+--- a/crates/runner-nordic/src/board/led.rs
++++ b/crates/runner-nordic/src/board/led.rs
+@@ -23,7 +23,7 @@ pub enum Impl {}
+ impl Support<usize> for Impl {
+     #[cfg(any(feature = "board-devkit", feature = "board-dongle"))]
+     const SUPPORT: usize = 4;
+-    #[cfg(feature = "board-makerdiary")]
++    #[cfg(any(feature = "board-makerdiary", feature = "board-techo"))]
+     const SUPPORT: usize = 3;
+ }
+ 
+diff --git a/crates/runner-nordic/src/board/vendor.rs b/crates/runner-nordic/src/board/vendor.rs
+index af5b40c..4547330 100644
+--- a/crates/runner-nordic/src/board/vendor.rs
++++ b/crates/runner-nordic/src/board/vendor.rs
+@@ -25,6 +25,8 @@ use crate::with_state;
+ 
+ #[cfg(feature = "ble-adv")]
+ pub mod ble_adv;
++#[cfg(feature = "techo-nfc")]
++pub mod nfc;
+ 
+ pub enum Impl {}
+ 
+@@ -36,6 +38,8 @@ impl Api for Impl {
+         match *event {
+             #[cfg(feature = "ble-adv")]
+             Event::BleAdv => Key::BleAdv,
++            #[cfg(feature = "techo-nfc")]
++            Event::Nfc => Key::Nfc,
+             #[cfg(feature = "test-vendor")]
+             Event::Vendor(ref event) => Key::Vendor(syscall_test::key(event)),
+         }
+@@ -55,6 +59,8 @@ impl Api for Impl {
+             (0x80000000, x, y, z) => Ok(crate::board::gpio::syscall(x, y, z)?),
+             #[cfg(feature = "ble-adv")]
+             (::ble_adv::SYSCALL_ID, x, y, z) => Ok(ble_adv::syscall(memory, handlers, x, y, z)?),
++            #[cfg(feature = "techo-nfc")]
++            (nfc::SYSCALL_ID, x, y, z) => Ok(nfc::syscall(memory, handlers, x, y, z)?),
+             _ => Err(Failure::TRAP),
+         }
+     }
+@@ -67,6 +73,8 @@ impl Api for Impl {
+         match event {
+             #[cfg(feature = "ble-adv")]
+             Event::BleAdv => (),
++            #[cfg(feature = "techo-nfc")]
++            Event::Nfc => (),
+             #[cfg(feature = "test-vendor")]
+             Event::Vendor(event) => syscall_test::callback(memory, handlers, event, params),
+         }
+@@ -76,6 +84,8 @@ impl Api for Impl {
+         match key {
+             #[cfg(feature = "ble-adv")]
+             Key::BleAdv => ble_adv::disable(),
++            #[cfg(feature = "techo-nfc")]
++            Key::Nfc => nfc::disable(),
+             #[cfg(feature = "test-vendor")]
+             Key::Vendor(key) => syscall_test::disable(key),
+         }
+@@ -87,6 +97,8 @@ impl Api for Impl {
+ pub enum Event {
+     #[cfg(feature = "ble-adv")]
+     BleAdv,
++    #[cfg(feature = "techo-nfc")]
++    Nfc,
+     #[cfg(feature = "test-vendor")]
+     Vendor(syscall_test::Event),
+ }
+@@ -96,6 +108,8 @@ pub enum Event {
+ pub enum Key {
+     #[cfg(feature = "ble-adv")]
+     BleAdv,
++    #[cfg(feature = "techo-nfc")]
++    Nfc,
+     #[cfg(feature = "test-vendor")]
+     Vendor(syscall_test::Key),
+ }
+diff --git a/crates/runner-nordic/src/board/vendor/nfc.rs b/crates/runner-nordic/src/board/vendor/nfc.rs
+new file mode 100644
+index 0000000..d2e9e56
+--- /dev/null
++++ b/crates/runner-nordic/src/board/vendor/nfc.rs
+@@ -0,0 +1,466 @@
++// NFC (ISO 14443-4 Type 4 Tag, raw ISO-DEP) vendor API for the LilyGO T-Echo Card.
++//
++// The applet (OpenSK) drives it through vendor syscall SYSCALL_ID:
++//   OP_REGISTER(func, data)  register the event handler; arms the KEY_1 (button A) wake detector
++//   OP_UNREGISTER            unregister
++//   OP_START / OP_STOP       start/stop tag emulation (NFCT sensing)
++//   OP_READ(ptr, len)        copy the pending complete C-APDU, returns its length (0 if none)
++//   OP_SEND(ptr, len)        send an R-APDU for the last C-APDU
++//   OP_STATUS                bit0 emulation running, bit1 field present, bit2 C-APDU pending,
++//                            bit3 button A pressed since the last OP_STATUS (cleared on read)
++// A single coalesced vendor event (Event::Nfc) is raised whenever any of these change.
++//
++// Button A detection uses the GPIO SENSE/PORT mechanism on P1.10 rather than a GPIOTE IN channel,
++// so it does not conflict with the applet's own use of button 0 for user presence.
++
++use alloc::vec::Vec;
++use core::cell::RefCell;
++
++use critical_section::Mutex;
++use wasefire_board_api::Failure;
++use wasefire_board_api::applet::{Handlers, Memory};
++use wasefire_board_api::vendor::Event as BoardEvent;
++use wasefire_error::{Code, Error};
++
++use crate::with_state;
++
++pub const SYSCALL_ID: u32 = 0x8000_0002;
++const OP_REGISTER: u32 = 1;
++const OP_UNREGISTER: u32 = 2;
++const OP_START: u32 = 3;
++const OP_STOP: u32 = 4;
++const OP_READ: u32 = 5;
++const OP_SEND: u32 = 6;
++const OP_STATUS: u32 = 7;
++
++const RX_MAX: usize = 4096;
++const TX_MAX: usize = 4096;
++
++struct Nfc {
++    initialized: bool,
++    registered: bool,
++    running: bool,
++    field: bool,
++    button: bool,
++    rx: Vec<u8>,
++    rx_complete: bool,
++}
++
++static NFC: Mutex<RefCell<Nfc>> = Mutex::new(RefCell::new(Nfc {
++    initialized: false,
++    registered: false,
++    running: false,
++    field: false,
++    button: false,
++    rx: Vec::new(),
++    rx_complete: false,
++}));
++
++/// The response buffer must outlive the ISO-DEP transmission, so it is static.
++struct TxBuf(core::cell::UnsafeCell<[u8; TX_MAX]>);
++unsafe impl Sync for TxBuf {}
++static TX: TxBuf = TxBuf(core::cell::UnsafeCell::new([0; TX_MAX]));
++
++fn with_nfc<R>(f: impl FnOnce(&mut Nfc) -> R) -> R {
++    critical_section::with(|cs| f(&mut NFC.borrow_ref_mut(cs)))
++}
++
++fn notify() {
++    if with_nfc(|n| n.registered) {
++        with_state(|state| state.events.push(BoardEvent(super::Event::Nfc).into()));
++    }
++}
++
++fn to_error(_: nrf_nfc::NfcError) -> Error {
++    Error::world(Code::InvalidState)
++}
++
++pub fn syscall(
++    memory: impl Memory, mut handlers: impl Handlers<super::Key>, x2: u32, x3: u32, x4: u32,
++) -> Result<u32, Failure> {
++    match (x2, x3, x4) {
++        (OP_REGISTER, func, data) => {
++            handlers.register(super::Key::Nfc, func, data)?;
++            #[cfg(feature = "board-techo")]
++            crate::techo_debug::flash_word(0x30, 0x0000_4E01); // NFC registered
++            init()?;
++            with_nfc(|n| n.registered = true);
++            arm_button();
++            Ok(0)
++        }
++        (OP_UNREGISTER, 0, 0) => {
++            with_nfc(|n| n.registered = false);
++            handlers.unregister(super::Key::Nfc)?;
++            Ok(0)
++        }
++        (OP_START, 0, 0) => {
++            if !with_nfc(|n| core::mem::replace(&mut n.running, true)) {
++                let result = nrf_nfc::start();
++                #[cfg(feature = "board-techo")]
++                crate::techo_debug::flash_word(0x33, 0x5000_0000 | (result.err().map_or(0, |e| e.0) as u32 & 0xffff));
++                result.map_err(to_error)?;
++            }
++            Ok(0)
++        }
++        (OP_STOP, 0, 0) => {
++            if with_nfc(|n| core::mem::replace(&mut n.running, false)) {
++                nrf_nfc::stop().map_err(to_error)?;
++            }
++            with_nfc(|n| {
++                n.field = false;
++                n.rx.clear();
++                n.rx_complete = false;
++            });
++            // Bring-up: emulation is stopped, so persisting the trace cannot disturb an exchange.
++            #[cfg(feature = "board-techo")]
++            nrf_nfc::flush_trace();
++            Ok(0)
++        }
++        (OP_READ, ptr, len) => {
++            let output = memory.get_mut(ptr, len)?;
++            Ok(with_nfc(|n| {
++                if !n.rx_complete {
++                    return Ok(0);
++                }
++                let size = n.rx.len();
++                if size > output.len() {
++                    return Err(Error::user(Code::InvalidLength));
++                }
++                output[.. size].copy_from_slice(&n.rx);
++                #[cfg(feature = "board-techo")]
++                {
++                    crate::techo_debug::flash_word(0xA0, 0xAD00_0000 | size as u32); // applet read APDU
++                    let head = u32::from_be_bytes([n.rx[0], *n.rx.get(1).unwrap_or(&0), *n.rx.get(2).unwrap_or(&0), *n.rx.get(3).unwrap_or(&0)]);
++                    crate::techo_debug::flash_word(0xA1, head);
++                    crate::techo_debug::flash_word(0xA8, cycles_now());
++                }
++                n.rx.clear();
++                n.rx_complete = false;
++                Ok(size as u32)
++            })?)
++        }
++        (OP_SEND, ptr, len) => {
++            let input = memory.get(ptr, len)?;
++            if input.len() > TX_MAX {
++                return Err(Error::user(Code::InvalidLength).into());
++            }
++            // Safety: the previous response was handed to the library before this new request was
++            // received, so ISO-DEP is done with the buffer.
++            let tx = unsafe { &mut *TX.0.get() };
++            tx[.. input.len()].copy_from_slice(input);
++            let result = unsafe { nrf_nfc::send(tx.as_ptr(), input.len()) };
++            #[cfg(feature = "board-techo")]
++            {
++                // R-APDU: length, first 4 bytes, status word and send result.
++                let mut head = [0u8; 4];
++                for (d, s) in head.iter_mut().zip(input.iter()) {
++                    *d = *s;
++                }
++                let sw = if input.len() >= 2 {
++                    u16::from_be_bytes([input[input.len() - 2], input[input.len() - 1]]) as u32
++                } else {
++                    0
++                };
++                nrf_nfc::trace(0xA7, input.len() as u32, u32::from_be_bytes(head));
++                nrf_nfc::trace(0xA9, sw, result.err().map_or(0, |e| e.0) as u32);
++                // Full R-APDU body after the first 4 bytes (8 bytes per entry).
++                let r = |i: usize| {
++                    let mut b = [0u8; 4];
++                    for (k, x) in b.iter_mut().enumerate() {
++                        *x = input.get(i + k).copied().unwrap_or(0);
++                    }
++                    u32::from_be_bytes(b)
++                };
++                let mut i = 4;
++                while LOG_APDU_DATA && i < input.len().min(400) {
++                    nrf_nfc::trace(0xAB, r(i), r(i + 4));
++                    i += 8;
++                }
++                crate::techo_debug::flash_word(0xA7, cycles_now());
++                crate::techo_debug::flash_word(0xA2, 0x5E00_0000 | input.len() as u32); // applet sent R-APDU
++                let mut h = [0u8; 4];
++                for (d, s) in h.iter_mut().zip(input.iter()) {
++                    *d = *s;
++                }
++                crate::techo_debug::flash_word(0xA3, u32::from_be_bytes(h));
++                crate::techo_debug::flash_word(0xA4, 0x7E5E_0000 | (result.err().map_or(0, |e| e.0) as u32 & 0xffff));
++            }
++            result.map_err(to_error)?;
++            Ok(0)
++        }
++        (OP_STATUS, 0, 0) => Ok({
++            with_nfc(|n| {
++            let status = n.running as u32
++                | (n.field as u32) << 1
++                | (n.rx_complete as u32) << 2
++                | (n.button as u32) << 3;
++            n.button = false;
++            status
++        })}),
++        _ => Err(Failure::TRAP),
++    }
++}
++
++fn init() -> Result<(), Error> {
++    if with_nfc(|n| core::mem::replace(&mut n.initialized, true)) {
++        return Ok(());
++    }
++    with_nfc(|n| n.rx.reserve_exact(RX_MAX));
++    #[cfg(feature = "board-techo")]
++    unsafe {
++        nrf_nfc::MARK = Some(crate::techo_debug::flash_word);
++    }
++    let result = unsafe { nrf_nfc::setup(callback) };
++    #[cfg(feature = "board-techo")]
++    crate::techo_debug::flash_word(0x31, 0x5E70_0000 | (result.err().map_or(0, |e| e.0) as u32 & 0xffff));
++    #[cfg(feature = "board-techo")]
++    start_flush_timer();
++    // Keep the library's default FWI (4): it extends the time automatically with S(WTX) requests.
++    // Advertising FWI 8 made Android stop discovering the tag.
++    result.map_err(to_error)
++}
++
++/// Called by the Type 4 Tag library from the NFCT interrupt.
++unsafe extern "C" fn callback(
++    _ctx: *mut core::ffi::c_void, event: u8, data: *const u8, len: usize, flags: u32,
++) {
++    use nrf_nfc::event::*;
++    if event != nrf_nfc::event::DATA_IND {
++        nrf_nfc::trace(nrf_nfc::tag::APP_EVT, event as u32, len as u32);
++    }
++    let mut empty = false;
++    let changed = with_nfc(|n| match event {
++        FIELD_ON => {
++            n.field = true;
++            true
++        }
++        FIELD_OFF => {
++            n.field = false;
++            n.rx.clear();
++            n.rx_complete = false;
++            true
++        }
++        DATA_IND => {
++            if n.rx_complete {
++                // A new C-APDU while the previous one is unanswered: start over with this one.
++                n.rx.clear();
++                n.rx_complete = false;
++            }
++            if len > 0 && !data.is_null() {
++                let chunk = unsafe { core::slice::from_raw_parts(data, len) };
++                if n.rx.len() + chunk.len() <= RX_MAX {
++                    n.rx.extend_from_slice(chunk);
++                }
++            }
++            if flags & nrf_nfc::DI_FLAG_MORE == 0 && n.rx.is_empty() {
++                // Empty I-block (reader presence check): it must be answered right away or the
++                // library keeps waiting for a response and drops every later frame.
++                empty = true;
++                false
++            } else if flags & nrf_nfc::DI_FLAG_MORE == 0 {
++                #[cfg(feature = "board-techo")]
++                {
++                    // C-APDU complete: length, CLA INS P1 P2, then bytes 4..8 (Lc / CTAP command).
++                    let w = |i: usize| {
++                        let mut b = [0u8; 4];
++                        for (k, x) in b.iter_mut().enumerate() {
++                            *x = n.rx.get(i + k).copied().unwrap_or(0);
++                        }
++                        u32::from_be_bytes(b)
++                    };
++                    nrf_nfc::trace(0xA5, n.rx.len() as u32, w(0));
++                    nrf_nfc::trace(0xA8, w(4), w(8));
++                    // Full C-APDU body (8 bytes per entry) for offline CBOR decoding.
++                    let mut i = 12;
++                    while LOG_APDU_DATA && i < n.rx.len().min(400) {
++                        nrf_nfc::trace(0xAA, w(i), w(i + 4));
++                        i += 8;
++                    }
++                }
++                n.rx_complete = true;
++                true
++            } else {
++                false
++            }
++        }
++        DATA_TRANSMITTED => false,
++        _ => false,
++    });
++    if empty {
++        static EMPTY_OK: [u8; 2] = [0x90, 0x00];
++        let r = unsafe { nrf_nfc::send(EMPTY_OK.as_ptr(), 0) };
++        let r2 = if r.is_err() { unsafe { nrf_nfc::send(EMPTY_OK.as_ptr(), 2) } } else { Ok(()) };
++        nrf_nfc::trace(0xA6, r.err().map_or(0, |e| e.0) as u32, r2.err().map_or(0, |e| e.0) as u32);
++    }
++    if changed {
++        notify();
++    }
++}
++
++// ── Button A (KEY_1, P1.10) wake detector via GPIO SENSE + GPIOTE PORT event ───────────────────
++
++const P1_PIN_CNF_10: usize = 0x5000_0300 + 0x700 + 4 * 10;
++const P1_IN: usize = 0x5000_0300 + 0x510;
++const GPIOTE_EVENTS_PORT: usize = 0x4000_617C;
++const GPIOTE_INTENSET: usize = 0x4000_6304;
++
++fn reg_read(addr: usize) -> u32 {
++    unsafe { core::ptr::read_volatile(addr as *const u32) }
++}
++
++fn reg_write(addr: usize, value: u32) {
++    unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
++}
++
++fn arm_button() {
++    // SENSE = Low (3 << 16), keeping direction/input/pull as configured by the runner.
++    let cnf = reg_read(P1_PIN_CNF_10) & !(3 << 16);
++    reg_write(P1_PIN_CNF_10, cnf | (3 << 16));
++    reg_write(GPIOTE_EVENTS_PORT, 0);
++    reg_write(GPIOTE_INTENSET, 1 << 31);
++}
++
++/// Called from the GPIOTE interrupt.
++pub fn gpiote_port() {
++    if reg_read(GPIOTE_EVENTS_PORT) == 0 {
++        return;
++    }
++    reg_write(GPIOTE_EVENTS_PORT, 0);
++    let pressed = reg_read(P1_IN) & (1 << 10) == 0;
++    #[cfg(feature = "board-techo")]
++    crate::techo_debug::flash_word(0x32, 0xB070_0000 | pressed as u32); // PORT event (button A)
++    #[cfg(feature = "board-techo")]
++    if pressed {
++        nrf_nfc::flush_trace(); // bring-up: press A after a test to persist the NFC trace
++    }
++    if pressed && with_nfc(|n| n.registered) {
++        with_nfc(|n| n.button = true);
++        notify();
++    }
++}
++
++pub fn irq_nfct() {
++    nrf_nfc::irq_nfct();
++}
++
++/// Bring-up: persists the RAM trace once it has stopped growing for 2 ticks of RTC2 (1 s each).
++/// Runs from its own RTC interrupt so it does not depend on the applet polling or on button A.
++#[cfg(feature = "board-techo")]
++pub fn irq_rtc2() {
++    use core::sync::atomic::AtomicUsize;
++    use core::sync::atomic::Ordering::Relaxed;
++    const RTC2: usize = 0x4002_4000;
++    reg_write(RTC2 + 0x140, 0); // EVENTS_COMPARE[0]
++    reg_write(RTC2 + 0x008, 1); // TASKS_CLEAR
++    static TICKS: AtomicUsize = AtomicUsize::new(0);
++    static FLUSHED: AtomicUsize = AtomicUsize::new(0);
++    static LAST_LEN: AtomicUsize = AtomicUsize::new(0);
++    static STABLE: AtomicUsize = AtomicUsize::new(0);
++    // Button A (KEY_1, P1.10, active low): polled every 125 ms. The GPIO SENSE/PORT detector never
++    // fired on this board, and the pin's GPIOTE channel belongs to the applet's user-presence
++    // check, so polling is the reliable way to open the NFC window.
++    static WAS_PRESSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++    let pressed = reg_read(P1_IN) & (1 << 10) == 0;
++    if pressed && !WAS_PRESSED.swap(true, Relaxed) {
++        crate::techo_debug::flash_word(0x32, 0xB070_0001); // button A seen
++        if with_nfc(|n| n.registered) {
++            with_nfc(|n| n.button = true);
++            notify();
++        }
++    } else if !pressed {
++        WAS_PRESSED.store(false, Relaxed);
++    }
++    static SUB: AtomicUsize = AtomicUsize::new(0);
++    if SUB.fetch_add(1, Relaxed) % 8 != 7 {
++        return; // the rest runs once per second
++    }
++    let n = nrf_nfc::TRACE_LEN.load(Relaxed); // total entries ever (the trace is a ring)
++    let tick = TICKS.fetch_add(1, Relaxed);
++    if tick == 0 {
++        crate::techo_debug::flash_word(0x90, 0x7100_0000 | n as u32); // first RTC2 tick
++    }
++    if n == LAST_LEN.swap(n, Relaxed) {
++        STABLE.fetch_add(1, Relaxed);
++    } else {
++        STABLE.store(0, Relaxed);
++    }
++    // Flash writes stall the CPU (~40 us each, hundreds of them): only flush once no reader field
++    // has been present for a while, or presence checks go unanswered and the phone drops the tag.
++    static NO_FIELD: AtomicUsize = AtomicUsize::new(0);
++    // FIELD_OFF is not always delivered, so look at the hardware: field present or lock detected,
++    // or the tag not back in sense mode (NFCTAGSTATE 0 = disabled/sensing).
++    let field = reg_read(0x4000_543C) & 3 != 0 || reg_read(0x4000_5410) != 0;
++    if field {
++        NO_FIELD.store(0, Relaxed);
++    } else {
++        NO_FIELD.fetch_add(1, Relaxed);
++    }
++    if n > 2 && n > FLUSHED.load(Relaxed) && STABLE.load(Relaxed) >= 2 && NO_FIELD.load(Relaxed) >= 3 {
++        crate::techo_debug::flash_word(0x91, 0xF100_0000 | n as u32); // flush attempt
++        nrf_nfc::flush_trace();
++        FLUSHED.store(n, Relaxed);
++    }
++}
++
++/// Finds the exception frame of the outermost handler by scanning up the stack for the
++/// EXC_RETURN value its prologue pushed, and returns the interrupted PC (0 if not found).
++#[cfg(feature = "board-techo")]
++#[inline(never)]
++fn stacked_pc() -> (u32, u32) {
++    let sp = cortex_m::register::msp::read() as usize;
++    for i in 0 .. 96 {
++        let addr = sp + 4 * i;
++        if addr + 32 >= 0x2004_0000 {
++            break;
++        }
++        let w = unsafe { (addr as *const u32).read_volatile() };
++        if matches!(w, 0xFFFF_FFF1 | 0xFFFF_FFF9 | 0xFFFF_FFFD | 0xFFFF_FFE1 | 0xFFFF_FFE9 | 0xFFFF_FFED) {
++            let frame = addr + 4;
++            let pc = unsafe { ((frame + 24) as *const u32).read_volatile() };
++            let lr = unsafe { ((frame + 20) as *const u32).read_volatile() };
++            return (pc, lr);
++        }
++    }
++    (0, 0)
++}
++
++#[cfg(feature = "board-techo")]
++fn start_flush_timer() {
++    const CLOCK: usize = 0x4000_0000;
++    const RTC2: usize = 0x4002_4000;
++    if reg_read(CLOCK + 0x418) & (1 << 16) == 0 {
++        // LFCLK not running: start the internal RC oscillator.
++        reg_write(CLOCK + 0x104, 0); // EVENTS_LFCLKSTARTED
++        reg_write(CLOCK + 0x518, 0); // LFCLKSRC = RC
++        reg_write(CLOCK + 0x008, 1); // TASKS_LFCLKSTART
++        let mut spins = 0u32;
++        while reg_read(CLOCK + 0x104) == 0 && spins < 2_000_000 {
++            spins += 1;
++        }
++    }
++    reg_write(RTC2 + 0x004, 1); // TASKS_STOP
++    reg_write(RTC2 + 0x508, 4095); // PRESCALER: 8 Hz
++    reg_write(RTC2 + 0x540, 1); // CC[0]: 125 ms (button A poll; the trace flush runs every 8th tick)
++    reg_write(RTC2 + 0x140, 0);
++    reg_write(RTC2 + 0x304, 1 << 16); // INTENSET COMPARE0
++    reg_write(RTC2 + 0x008, 1); // TASKS_CLEAR
++    reg_write(RTC2 + 0x000, 1); // TASKS_START
++}
++
++pub fn irq_timer0() {
++    nrf_nfc::irq_timer0();
++}
++
++pub fn disable() -> Result<(), Error> {
++    with_nfc(|n| n.registered = false);
++    Ok(())
++}
++
++#[cfg(feature = "board-techo")]
++fn cycles_now() -> u32 {
++    unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
++}
++
++/// Full APDU contents in the flight recorder (debugging only: off for everyday use).
++#[cfg(feature = "board-techo")]
++const LOG_APDU_DATA: bool = false;
+diff --git a/crates/runner-nordic/src/main.rs b/crates/runner-nordic/src/main.rs
+index 1ad2ba5..b138def 100644
+--- a/crates/runner-nordic/src/main.rs
++++ b/crates/runner-nordic/src/main.rs
+@@ -42,7 +42,7 @@ use nrf52840_hal::gpiote::Gpiote;
+ use nrf52840_hal::pac::{Interrupt, interrupt};
+ use nrf52840_hal::rng::Rng;
+ use nrf52840_hal::usbd::{UsbPeripheral, Usbd};
+-#[cfg(feature = "release")]
++#[cfg(all(feature = "release", not(feature = "board-techo")))]
+ use panic_abort as _;
+ #[cfg(feature = "debug")]
+ use panic_probe as _;
+@@ -81,10 +81,14 @@ use crate::board::vendor::ble_adv::Ble;
+ use crate::board::{Events, button, led};
+ use crate::storage::Storage;
+ 
++#[cfg(feature = "board-techo")]
++mod techo_debug;
++
+ exactly_one_of!["debug", "release"];
+ exactly_one_of!["native", "pulley", "wasm"];
+-exactly_one_of!["board-devkit", "board-dongle", "board-makerdiary"];
++exactly_one_of!["board-devkit", "board-dongle", "board-makerdiary", "board-techo"];
+ at_most_one_of!["fpc2534-sensor", "gpio"]; // they are incompatible
++at_most_one_of!["ble-adv", "techo-nfc"]; // both use TIMER0
+ 
+ #[cfg(feature = "debug")]
+ #[defmt::panic_handler]
+@@ -135,6 +139,44 @@ fn main() -> ! {
+     static mut CLOCKS: MaybeUninit<Clocks> = MaybeUninit::uninit();
+     static mut USB_BUS: MaybeUninit<UsbBusAllocator<Usb>> = MaybeUninit::uninit();
+ 
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(3);
++    // Instruction cache (off after reset): speeds up all code running from flash.
++    #[cfg(feature = "board-techo")]
++    unsafe { core::ptr::write_volatile(0x4001_E540 as *mut u32, 1) }; // NVMC.ICACHECNF.CACHEEN
++    // The UF2 bootloader on the T-Echo Card hands over with NVIC interrupts (notably USBD) still
++    // enabled/pending and the USBD peripheral possibly active. Start from a clean state: interrupts
++    // are unmasked again below, only once STATE is populated.
++    #[cfg(feature = "board-techo")]
++    unsafe {
++        let nvic = &*NVIC::PTR;
++        for i in 0 .. 2 {
++            nvic.icer[i].write(0xffff_ffff);
++            nvic.icpr[i].write(0xffff_ffff);
++        }
++        core::ptr::write_volatile(0x4002_7308 as *mut u32, 0xffff_ffff); // USBD.INTENCLR
++        core::ptr::write_volatile(0x4002_7500 as *mut u32, 0); // USBD.ENABLE = 0
++    }
++    // T-Echo Card power rails (same sequence as Meshtastic's earlyInitVariant): keep the GPS off
++    // (GPS_EN P1.15 active-low -> high, GPS_RF_EN P0.29 low, GPS_WAKE P0.25 low), then cycle the
++    // RT9080 3.3V peripheral rail enable (P0.30) high-low-high. The KEY_1 pull-up, the WS2812 LEDs
++    // and the OLED live on that rail.
++    #[cfg(feature = "board-techo")]
++    {
++        let w = |a: usize, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
++        const P0: usize = 0x5000_0000;
++        const P1: usize = 0x5000_0300;
++        w(P1 + 0x508, 1 << 15); // OUTSET P1.15
++        w(P1 + 0x518, 1 << 15); // DIRSET P1.15
++        w(P0 + 0x50C, (1 << 29) | (1 << 25)); // OUTCLR P0.29, P0.25
++        w(P0 + 0x518, (1 << 29) | (1 << 25) | (1 << 30)); // DIRSET P0.29, P0.25, P0.30
++        w(P0 + 0x508, 1 << 30);
++        cortex_m::asm::delay(64_000 * 100);
++        w(P0 + 0x50C, 1 << 30);
++        cortex_m::asm::delay(64_000 * 100);
++        w(P0 + 0x508, 1 << 30);
++        cortex_m::asm::delay(64_000 * 100);
++    }
+     allocator::init();
+     #[cfg(feature = "debug")]
+     let c = nrf52840_hal::pac::CorePeripherals::take().unwrap();
+@@ -156,6 +198,9 @@ fn main() -> ! {
+     let buttons = [Button::new(port1.p1_06.into_pullup_input().degrade())];
+     #[cfg(feature = "board-makerdiary")]
+     let buttons = [Button::new(port0.p0_18.into_pullup_input().degrade())];
++    // LilyGO T-Echo Card: KEY_1 on GPIO42 = P1.10 (active low).
++    #[cfg(feature = "board-techo")]
++    let buttons = [Button::new(port1.p1_10.into_pullup_input().degrade())];
+     #[cfg(feature = "board-devkit")]
+     let leds = [
+         port0.p0_13.into_push_pull_output(Level::High).degrade(),
+@@ -176,6 +221,14 @@ fn main() -> ! {
+         port0.p0_22.into_push_pull_output(Level::High).degrade(),
+         port0.p0_24.into_push_pull_output(Level::High).degrade(),
+     ];
++    // LilyGO T-Echo Card has only WS2812 RGB LEDs (data on P1.07, P1.12, P0.28). Driving their
++    // data lines with static levels is harmless (no valid WS2812 frame), so they act as dummy LEDs.
++    #[cfg(feature = "board-techo")]
++    let leds = [
++        port1.p1_07.into_push_pull_output(Level::High).degrade(),
++        port1.p1_12.into_push_pull_output(Level::High).degrade(),
++        port0.p0_28.into_push_pull_output(Level::High).degrade(),
++    ];
+     #[cfg(feature = "gpio")]
+     let gpios = [
+         Gpio::new(port1.p1_01.degrade(), 1, 1),
+@@ -215,8 +268,20 @@ fn main() -> ! {
+         board::fpc2534::State::new(spi, cs, &gpiote, &mut channels, irq)
+     };
+     // We enable all USB interrupts except STARTED and EPDATA which are feedback loops.
++    #[cfg(not(feature = "techo-nfc"))]
+     p.USBD.inten.write(|w| unsafe { w.bits(0x00fffffd) });
++    // T-Echo NFC: also drop SOF (bit 20). It fires every millisecond while a host is attached and
++    // the handler runs in a critical section, which starves the NFCT interrupt (ISO-DEP frame
++    // delay budget is a few hundred microseconds).
++    #[cfg(feature = "techo-nfc")]
++    p.USBD.inten.write(|w| unsafe { w.bits(0x00effffd) });
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(4);
++    #[cfg(feature = "board-techo")]
++    techo_debug::flash_word(0x27, 0x1000_0000 | unsafe { core::ptr::read_volatile(0x5000_0310 as *const u32) } >> 10 & 1); // KEY_1 level idle
+     let clocks = CLOCKS.write(clocks::Clocks::new(p.CLOCK).enable_ext_hfosc());
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(5);
+     let usb_bus = UsbBusAllocator::new(Usbd::new(UsbPeripheral::new(p.USBD, clocks)));
+     let usb_bus = USB_BUS.write(usb_bus);
+     let protocol = wasefire_protocol_usb::Rpc::new(usb_bus);
+@@ -232,6 +297,15 @@ fn main() -> ! {
+     let serial = Serial::new(SerialPort::new(usb_bus));
+     board::platform::init_serial(&p.FICR);
+     let usb_dev = wasefire_board_api::platform::usb_device::<_, Board>(usb_bus);
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(6);
++    #[cfg(feature = "board-techo")]
++    {
++        let rd = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
++        techo_debug::flash_word(0x20, rd(0x4000_0438)); // POWER.USBREGSTATUS
++        techo_debug::flash_word(0x21, rd(0x4002_7504)); // USBD.USBPULLUP
++        techo_debug::flash_word(0x22, rd(0x4002_7500)); // USBD.ENABLE
++    }
+     #[cfg(feature = "ble-adv")]
+     let ble = {
+         use alloc::boxed::Box;
+@@ -248,6 +322,8 @@ fn main() -> ! {
+     let store = wasefire_store::Store::new(Storage::new_store()).ok().unwrap();
+     crate::board::platform::update::init(Storage::new_other());
+     crate::board::applet::init(Storage::new_applet());
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(7);
+     #[cfg(feature = "uart")]
+     let uart = {
+         let uart_rx = port0.p0_28.into_floating_input().degrade();
+@@ -290,6 +366,8 @@ fn main() -> ! {
+         unsafe { NVIC::unmask(interrupt) };
+     }
+     log::debug!("Runner is initialized.");
++    #[cfg(feature = "board-techo")]
++    techo_debug::checkpoint(8);
+     Scheduler::<Board>::run();
+ }
+ 
+@@ -312,6 +390,12 @@ interrupts! {
+     RADIO = radio(),
+     #[cfg(feature = "ble-adv")]
+     TIMER0 = radio_timer(),
++    #[cfg(feature = "techo-nfc")]
++    TIMER0 = nfc_timer0(),
++    #[cfg(feature = "techo-nfc")]
++    NFCT = nfct(),
++    #[cfg(all(feature = "techo-nfc", feature = "board-techo"))]
++    RTC2 = nfc_rtc2(),
+     TIMER1 = clock(),
+     TIMER2 = timer(0),
+     TIMER3 = timer(1),
+@@ -323,6 +407,10 @@ interrupts! {
+ }
+ 
+ fn gpiote() {
++    #[cfg(feature = "techo-nfc")]
++    board::vendor::nfc::gpiote_port();
++    #[cfg(feature = "board-techo")]
++    techo_debug::flash_word(0x28, 0x0000_9107); // first GPIOTE interrupt
+     with_state(|state| {
+         for i in 0 .. state.channels.0.len() {
+             let id = Id::new(i).unwrap();
+@@ -376,6 +464,14 @@ fn uarte() {
+ }
+ 
+ fn usbd() {
++    #[cfg(feature = "board-techo")]
++    {
++        let rd = |a: usize| unsafe { core::ptr::read_volatile(a as *const u32) };
++        techo_debug::flash_word(0x23, 0x1000_0000 | rd(0x4002_7400)); // first IRQ: EVENTCAUSE
++        if rd(0x4002_7100) != 0 {
++            techo_debug::flash_word(0x24, 0x000B_E5E7); // EVENTS_USBRESET seen
++        }
++    }
+     with_state(|state| {
+         let mut classes: [&mut dyn UsbClass<_>; _] = [
+             &mut state.protocol,
+@@ -386,6 +482,12 @@ fn usbd() {
+         ];
+         #[cfg_attr(not(feature = "usb-serial"), allow(unused_variables))]
+         let polled = state.usb_dev.poll(&mut classes);
++        #[cfg(feature = "board-techo")]
++        match state.usb_dev.state() {
++            UsbDeviceState::Addressed => techo_debug::flash_word(0x25, 0x0000_0ADD),
++            UsbDeviceState::Configured => techo_debug::flash_word(0x26, 0x000C_0F16),
++            _ => (),
++        }
+         if state.usb_dev.state() != UsbDeviceState::Configured {
+             return;
+         }
+@@ -396,3 +498,18 @@ fn usbd() {
+         state.serial.tick(polled, |event| state.events.push(event.into()));
+     });
+ }
++
++#[cfg(feature = "techo-nfc")]
++fn nfct() {
++    board::vendor::nfc::irq_nfct();
++}
++
++#[cfg(all(feature = "techo-nfc", feature = "board-techo"))]
++fn nfc_rtc2() {
++    board::vendor::nfc::irq_rtc2();
++}
++
++#[cfg(feature = "techo-nfc")]
++fn nfc_timer0() {
++    board::vendor::nfc::irq_timer0();
++}
+diff --git a/crates/runner-nordic/src/storage.rs b/crates/runner-nordic/src/storage.rs
+index 3fe0b42..d473f31 100644
+--- a/crates/runner-nordic/src/storage.rs
++++ b/crates/runner-nordic/src/storage.rs
+@@ -263,9 +263,36 @@ impl store::Storage for Storage {
+ 
+     fn erase_page(&mut self, page: usize) -> Result<(), Error> {
+         let from = offset(self, PAGE_SIZE, StorageIndex { page, byte: 0 })?;
+-        let to = from + PAGE_SIZE as u32;
+-        let mut helper = Helper::new(self);
+-        helper.nvmc().erase(from, to).map_err(convert)
++        #[cfg(feature = "board-techo")]
++        {
++            // Partial erase in 10 ms steps (nRF52840 ERASEPAGEPARTIAL): a full page erase halts
++            // the CPU for ~85 ms, which starves the NFCT interrupt (ISO-DEP waiting-time
++            // extensions) while OpenSK stores a credential, and the phone drops the tag.
++            let _helper = Helper::new(self); // owns the NVMC while we drive it directly
++            let addr = self.ptr as *mut u8 as usize + from as usize;
++            let reg = |a: usize| a as *mut u32;
++            unsafe {
++                let ready = 0x4001_E400 as *const u32;
++                while ready.read_volatile() == 0 {}
++                reg(0x4001_E51C).write_volatile(10); // ERASEPAGEPARTIALCFG: 10 ms per step
++                reg(0x4001_E504).write_volatile(2); // CONFIG = erase enabled
++                for _ in 0 .. 10 {
++                    // 10 x 10 ms >= tERASEPAGE (85 ms); interrupts run between the steps.
++                    while ready.read_volatile() == 0 {}
++                    reg(0x4001_E518).write_volatile(addr as u32); // ERASEPAGEPARTIAL
++                    while ready.read_volatile() == 0 {}
++                }
++                reg(0x4001_E504).write_volatile(0); // CONFIG = read only
++                while ready.read_volatile() == 0 {}
++            }
++            return Ok(());
++        }
++        #[allow(unreachable_code)]
++        {
++            let to = from + PAGE_SIZE as u32;
++            let mut helper = Helper::new(self);
++            helper.nvmc().erase(from, to).map_err(convert)
++        }
+     }
+ }
+ 
+diff --git a/crates/runner-nordic/src/techo_debug.rs b/crates/runner-nordic/src/techo_debug.rs
+new file mode 100644
+index 0000000..01ba6ae
+--- /dev/null
++++ b/crates/runner-nordic/src/techo_debug.rs
+@@ -0,0 +1,92 @@
++// Bring-up diagnostics for the LilyGO T-Echo Card (no debug probe, no plain LEDs).
++//
++// Every boot checkpoint programs a word in a dedicated flash page (MARKER_PAGE, erased by the
++// UF2 image) and beeps the buzzer (P1.06). After a double reset into the UF2 bootloader the page
++// can be read back from CURRENT.UF2 to see exactly how far boot got and, on a fault, where.
++//
++// Layout of MARKER_PAGE (word index):
++//   0x00..0x0f  checkpoint words: word[n] = 0xC0DE0000 | n when checkpoint n is reached
++//   0x40..0x47  fault record: magic, source, PC, LR, CFSR, HFSR, BFAR, MMFAR
++
++pub const MARKER_PAGE: usize = 0x000E_9000;
++const NVMC_READY: usize = 0x4001_E400;
++const NVMC_CONFIG: usize = 0x4001_E504;
++
++const P1_BASE: usize = 0x5000_0300;
++const OUTSET: usize = P1_BASE + 0x508;
++const OUTCLR: usize = P1_BASE + 0x50C;
++const DIRSET: usize = P1_BASE + 0x518;
++const PIN: u32 = 6;
++const HALF_PERIOD_CYCLES: u32 = 11_800;
++
++fn write(addr: usize, value: u32) {
++    unsafe { core::ptr::write_volatile(addr as *mut u32, value) };
++}
++
++fn read(addr: usize) -> u32 {
++    unsafe { core::ptr::read_volatile(addr as *const u32) }
++}
++
++/// Programs one flash word if it is still erased.
++pub fn flash_word(index: usize, value: u32) {
++    let addr = MARKER_PAGE + 4 * index;
++    if read(addr) != 0xffff_ffff {
++        return;
++    }
++    while read(NVMC_READY) == 0 {}
++    write(NVMC_CONFIG, 1);
++    while read(NVMC_READY) == 0 {}
++    write(addr, value);
++    while read(NVMC_READY) == 0 {}
++    write(NVMC_CONFIG, 0);
++    while read(NVMC_READY) == 0 {}
++}
++
++fn tone(ms: u32) {
++    write(DIRSET, 1 << PIN);
++    let cycles = ms * 64_000 / (2 * HALF_PERIOD_CYCLES);
++    for _ in 0 .. cycles {
++        write(OUTSET, 1 << PIN);
++        cortex_m::asm::delay(HALF_PERIOD_CYCLES);
++        write(OUTCLR, 1 << PIN);
++        cortex_m::asm::delay(HALF_PERIOD_CYCLES);
++    }
++    write(OUTCLR, 1 << PIN);
++}
++
++fn pause(ms: u32) {
++    cortex_m::asm::delay(ms * 64_000);
++}
++
++/// Boot checkpoint `n` (flash marker only) (the Wasefire bootloader records 1 and 2, the runner 3 and up).
++pub fn checkpoint(n: usize) {
++    // Silent: any delay here would stall USB enumeration once the pull-up is enabled.
++    flash_word(n, 0xC0DE_0000 | n as u32);
++}
++
++/// Records a fault and beeps forever.
++pub fn fatal(source: u32, pc: u32, lr: u32) -> ! {
++    flash_word(0x40, 0xFA17_FA17);
++    flash_word(0x41, source);
++    flash_word(0x42, pc);
++    flash_word(0x43, lr);
++    flash_word(0x44, read(0xE000_ED28)); // CFSR
++    flash_word(0x45, read(0xE000_ED2C)); // HFSR
++    flash_word(0x46, read(0xE000_ED38)); // BFAR
++    flash_word(0x47, read(0xE000_ED34)); // MMFAR
++    loop {
++        tone(80);
++        pause(80);
++    }
++}
++
++#[cfg(feature = "release")]
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo) -> ! {
++    fatal(0x0000_9A41, 0, 0) // "PANIC"
++}
++
++#[cortex_m_rt::exception]
++unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
++    fatal(0x0000_0002, ef.pc(), ef.lr())
++}
+diff --git a/crates/xtask/src/main.rs b/crates/xtask/src/main.rs
+index bf77965..673d81f 100644
+--- a/crates/xtask/src/main.rs
++++ b/crates/xtask/src/main.rs
+@@ -313,7 +313,7 @@ struct RunnerOptions {
+     ///
+     /// Each runner supports its own set of boards:
+     /// - Host doesn't have a notion of board.
+-    /// - Nordic supports devkit (default), dongle, and makerdiary.
++    /// - Nordic supports devkit (default), dongle, makerdiary, and techo.
+     /// - OpenTitan doesn't have a notion of board yet.
+     #[arg(long, verbatim_doc_comment)]
+     board: Option<String>,
+@@ -894,13 +894,16 @@ impl RunnerOptions {
+         if self.name == RunnerName::Nordic {
+             let board = board.unwrap();
+             let board_feature = match board {
+-                "makerdiary" => "dongle",
++                "makerdiary" | "techo" => "dongle",
+                 _ => board,
+             };
+             let mut cargo = Command::new("cargo");
+             cargo.current_dir("crates/runner-nordic/crates/bootloader");
+             cargo.args(["build", "--release", "--target=thumbv7em-none-eabi"]);
+             cargo.arg(format!("--features=board-{board_feature}"));
++            if board == "techo" {
++                cargo.arg("--features=techo-beep");
++            }
+             if self.single_sided {
+                 cargo.arg("--features=single-sided");
+             }
+@@ -908,7 +911,7 @@ impl RunnerOptions {
+             // TODO(https://github.com/rust-lang/rust/issues/122105): Remove when fixed.
+             cargo.env("RUSTFLAGS", "--allow=unused-crate-dependencies");
+             cmd::execute(&mut cargo).await?;
+-            if matches!(board, "dongle" | "makerdiary") {
++            if matches!(board, "dongle" | "makerdiary" | "techo") {
+                 let runner = self.bundle(&elf, side).await?;
+                 let bootloader = "target/thumbv7em-none-eabi/release/bootloader";
+                 let mut objcopy = wrap_command().await?;

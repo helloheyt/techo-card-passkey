@@ -1,0 +1,977 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7a3d0d8..ab49368 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -46,4 +46,6 @@ debug = ["opensk/debug_ctap"]
+ ed25519 = ["opensk/ed25519", "wasefire/api-crypto-ed25519"]
+ fingerprint = ["dep:wasefire-common", "opensk/fingerprint", "wasefire/api-fingerprint-matcher"]
+ led-1 = []
++# LilyGO T-Echo Card: CTAP over NFC through the runner's NFC vendor syscall.
++nfc = ["opensk/nfc", "wasefire/api-vendor"]
+ test = ["wasefire/test"]
+diff --git a/flash.sh b/flash.sh
+index 33c4b12..b90a6be 100755
+--- a/flash.sh
++++ b/flash.sh
+@@ -30,6 +30,7 @@ usage() {
+   echo "  nrf52840dk         Nordic nRF52840 Development Kit"
+   echo "  nrf52840_dongle    Nordic nRF52840 Dongle"
+   echo "  nrf52840_mdk       Makerdiary nRF52840 MDK USB Dongle"
++  echo "  nrf52840_techo     LilyGO T-Echo Card (builds platform.hex only; convert with tools/techo_uf2.py)"
+   exit 1
+ }
+ 
+@@ -124,6 +125,19 @@ case $TARGET in
+         --features="$SOFTWARE_CRYPTO_FEATURES" \
+       "${CMD[@]}"
+     ;;
++  nrf52840_techo)
++    TECHO_FEATURES="$FEATURES"
++    if [[ ! "$TECHO_FEATURES" =~ "led-1" ]]; then
++      TECHO_FEATURES="$TECHO_FEATURES,led-1"
++    fi
++    TECHO_FEATURES="$TECHO_FEATURES,nfc"
++    # Size-optimized, but the crypto crates are built at opt-level 3 (runner-nordic Cargo.toml):
++    # over NFC every CTAP command must finish within the reader frame waiting time.
++    cargo xtask --release --native applet rust ../.. --opt-level=z --features="$TECHO_FEATURES" \
++      runner nordic --board=techo --opt-level=z --features=usb-ctap,techo-nfc \
++        --features=software-crypto-aes256-cbc,software-crypto-hmac-sha256,p256-cm4 \
++      flash --artifacts
++    ;;
+   *)
+     echo "Error: Unknown target $TARGET"
+     usage
+diff --git a/libraries/opensk/Cargo.toml b/libraries/opensk/Cargo.toml
+index ae86f21..37b4000 100644
+--- a/libraries/opensk/Cargo.toml
++++ b/libraries/opensk/Cargo.toml
+@@ -47,6 +47,8 @@ software_crypto = ["rand", "sha2", "hmac", "hkdf", "aes", "cbc", "p256"]
+ ed25519 = []
+ software_crypto_ed25519 = ["software_crypto", "ed25519", "ed25519-compact"]
+ fingerprint = []
++# CTAP over NFC (ISO 14443-4). User presence is implied by the tap.
++nfc = []
+ 
+ [dev-dependencies]
+ enum-iterator = "2.3.0"
+diff --git a/libraries/opensk/src/ctap/fingerprint.rs b/libraries/opensk/src/ctap/fingerprint.rs
+index 2ce3566..2d4fc5c 100644
+--- a/libraries/opensk/src/ctap/fingerprint.rs
++++ b/libraries/opensk/src/ctap/fingerprint.rs
+@@ -169,6 +169,8 @@ fn check_fingerprint_loop<E: Env>(
+         Channel::MainHid(cid) => (cid, Transport::MainHid),
+         #[cfg(feature = "vendor_hid")]
+         Channel::VendorHid(cid) => (cid, Transport::VendorHid),
++        #[cfg(feature = "nfc")]
++        Channel::Nfc => return Err(Ctap2StatusCode::CTAP2_ERR_UNSUPPORTED_OPTION),
+     };
+     let endpoint = transport.usb_endpoint();
+ 
+diff --git a/libraries/opensk/src/ctap/mod.rs b/libraries/opensk/src/ctap/mod.rs
+index abbd9c3..97b51ed 100644
+--- a/libraries/opensk/src/ctap/mod.rs
++++ b/libraries/opensk/src/ctap/mod.rs
+@@ -180,6 +180,9 @@ pub enum Channel {
+     /// No equivalent in CTAP, used for communication outside the specification.
+     #[cfg(feature = "vendor_hid")]
+     VendorHid(ChannelID),
++    /// Corresponds to CTAP's NFC transport (a single logical channel).
++    #[cfg(feature = "nfc")]
++    Nfc,
+ }
+ 
+ // Helpers to perform CBOR read/write while respecting CTAP2 nesting limits.
+@@ -309,6 +312,9 @@ fn wait_and_respond_busy<E: Env>(env: &mut E, channel: Channel) -> CtapResult<()
+         Channel::MainHid(cid) => (cid, Transport::MainHid),
+         #[cfg(feature = "vendor_hid")]
+         Channel::VendorHid(cid) => (cid, Transport::VendorHid),
++        // Presence over NFC is established by the tap (see check_user_presence).
++        #[cfg(feature = "nfc")]
++        Channel::Nfc => return Ok(()),
+     };
+     let endpoint = transport.usb_endpoint();
+ 
+@@ -352,6 +358,14 @@ fn wait_and_respond_busy<E: Env>(env: &mut E, channel: Channel) -> CtapResult<()
+ pub fn check_user_presence<E: Env>(env: &mut E, channel: Channel) -> CtapResult<()> {
+     const TIMEOUT_ERROR: Ctap2StatusCode = Ctap2StatusCode::CTAP2_ERR_USER_ACTION_TIMEOUT;
+ 
++    // CTAP 2.1 (11.3): over NFC, user presence is asserted by bringing the authenticator into the
++    // reader field. The T-Echo port additionally only enables NFC for a short window after the user
++    // pressed the button, so the tap follows an explicit physical action.
++    #[cfg(feature = "nfc")]
++    if matches!(channel, Channel::Nfc) {
++        return Ok(());
++    }
++
+     env.user_presence().check_init();
+     let loop_timer = env.clock().make_timer(TOUCH_TIMEOUT_MS);
+ 
+@@ -701,6 +715,8 @@ impl<E: Env> CtapState<E> {
+         }
+         match channel {
+             Channel::MainHid(_) => self.process_fido_command(env, command, channel),
++            #[cfg(feature = "nfc")]
++            Channel::Nfc => self.process_fido_command(env, command, channel),
+             #[cfg(feature = "vendor_hid")]
+             Channel::VendorHid(_) => self.process_vendor_command(env, command),
+         }
+@@ -1436,7 +1452,11 @@ impl<E: Env> CtapState<E> {
+                     .max_credential_count_in_list()
+                     .map(|c| c as u64),
+                 max_credential_id_length: Some(MAX_CREDENTIAL_ID_SIZE as u64),
+-                transports: Some(vec![AuthenticatorTransport::Usb]),
++                transports: Some(vec![
++                    AuthenticatorTransport::Usb,
++                    #[cfg(feature = "nfc")]
++                    AuthenticatorTransport::Nfc,
++                ]),
+                 algorithms: Some(SUPPORTED_CRED_PARAMS.to_vec()),
+                 max_serialized_large_blob_array: Some(MAX_LARGE_BLOB_ARRAY_SIZE as u64),
+                 force_pin_change: Some(env.persist().has_force_pin_change()?),
+diff --git a/libraries/opensk/src/lib.rs b/libraries/opensk/src/lib.rs
+index c56a4b8..35961f5 100644
+--- a/libraries/opensk/src/lib.rs
++++ b/libraries/opensk/src/lib.rs
+@@ -112,6 +112,13 @@ impl<E: Env> Ctap<E> {
+         }
+     }
+ 
++    /// Processes a complete CTAP2 command received over NFC and returns the response bytes
++    /// (status code followed by the CBOR payload).
++    #[cfg(feature = "nfc")]
++    pub fn process_nfc_command(&mut self, command: &[u8]) -> alloc::vec::Vec<u8> {
++        self.state.process_command(&mut self.env, command, crate::ctap::Channel::Nfc)
++    }
++
+     pub fn should_wink(&mut self) -> bool {
+         self.hid.should_wink(&mut self.env)
+     }
+diff --git a/src/env/hid_connection.rs b/src/env/hid_connection.rs
+index b63b5d7..a46f417 100644
+--- a/src/env/hid_connection.rs
++++ b/src/env/hid_connection.rs
+@@ -46,6 +46,16 @@ pub(crate) fn recv(packet: &mut [u8; 64], timeout_ms: Option<usize>) -> CtapResu
+         if timeout_is_over() {
+             return Ok(RecvStatus::Timeout);
+         }
+-        scheduling::wait_until(|| timeout_is_over() || listener.is_notified());
++        // An NFC event (button A, reader field, APDU) interrupts the wait so the main loop can
++        // service it; it is reported as a timeout.
++        #[cfg(feature = "nfc")]
++        if crate::nfc::is_notified() {
++            return Ok(RecvStatus::Timeout);
++        }
++        #[cfg(feature = "nfc")]
++        let nfc_notified = crate::nfc::is_notified;
++        #[cfg(not(feature = "nfc"))]
++        let nfc_notified = || false;
++        scheduling::wait_until(|| timeout_is_over() || listener.is_notified() || nfc_notified());
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index aaaefc4..7107356 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,6 +23,8 @@ use opensk::env::Env as _;
+ 
+ mod blink;
+ mod env;
++#[cfg(feature = "nfc")]
++mod nfc;
+ mod touch;
+ 
+ #[allow(dead_code)]
+@@ -31,6 +33,8 @@ fn main() -> ! {
+     let mut wink: Option<blink::Blink> = None;
+     #[cfg(feature = "ctap1")]
+     let mut u2f: Option<touch::Touch> = None;
++    #[cfg(feature = "nfc")]
++    let mut nfc = nfc::Nfc::new();
+     debug!("OpenSK initialized");
+     loop {
+         update_state(&mut wink, opensk_ctap.should_wink(), || {
+@@ -41,8 +45,13 @@ fn main() -> ! {
+         timeout |= wink.is_some();
+         #[cfg(feature = "ctap1")]
+         (timeout |= u2f.is_some());
+-        match env::hid_connection::recv(recv_packet.as_mut().unwrap(), timeout.then_some(500))
+-            .unwrap()
++        #[allow(unused_mut)]
++        let mut timeout_ms = timeout.then_some(500);
++        #[cfg(feature = "nfc")]
++        if nfc.as_ref().is_some_and(|n| n.is_active()) {
++            timeout_ms = Some(timeout_ms.map_or(nfc::POLL_MS, |t| t.min(nfc::POLL_MS)));
++        }
++        match env::hid_connection::recv(recv_packet.as_mut().unwrap(), timeout_ms).unwrap()
+         {
+             RecvStatus::Timeout => recv_packet = None,
+             RecvStatus::Received(endpoint) => assert_eq!(endpoint, UsbEndpoint::MainHid),
+@@ -61,6 +70,12 @@ fn main() -> ! {
+                     .unwrap();
+             }
+         }
++        #[cfg(feature = "nfc")]
++        if let Some(nfc) = nfc.as_mut()
++            && (nfc::take_notified() || nfc.is_active())
++        {
++            nfc.service(&mut opensk_ctap);
++        }
+         #[cfg(feature = "ctap1")]
+         update_state(
+             &mut u2f,
+diff --git a/src/nfc.rs b/src/nfc.rs
+new file mode 100644
+index 0000000..253df3f
+--- /dev/null
++++ b/src/nfc.rs
+@@ -0,0 +1,275 @@
++//! CTAP over NFC for the LilyGO T-Echo Card (FIDO CTAP 2.1, section 11.3).
++//!
++//! The platform (runner) exposes raw ISO 14443-4 APDUs through a vendor syscall. This module:
++//! - opens a short NFC window after the user presses button A (the platform reports the press),
++//!   keeping it open while a reader is in the field,
++//! - implements the APDU layer: SELECT of the FIDO AID, NFCCTAP_MSG, command chaining (CLA bit 4),
++//!   short and extended APDUs, and response chaining with `61 XX` + GET RESPONSE,
++//! - hands CTAP2 CBOR commands to OpenSK on `Channel::Nfc` (presence is implied by the tap).
++
++use alloc::vec::Vec;
++use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
++
++use wasefire::debug;
++use wasefire::timer::Timeout;
++use wasefire::vendor::syscall;
++
++const SYSCALL_ID: usize = 0x8000_0002;
++const OP_REGISTER: usize = 1;
++const OP_START: usize = 3;
++const OP_STOP: usize = 4;
++const OP_READ: usize = 5;
++const OP_SEND: usize = 6;
++const OP_STATUS: usize = 7;
++
++const STATUS_FIELD: usize = 1 << 1;
++const STATUS_APDU: usize = 1 << 2;
++const STATUS_BUTTON: usize = 1 << 3;
++
++/// How long NFC stays enabled after pressing button A (without a reader in the field).
++const WINDOW_MS: usize = 30_000;
++/// Keep NFC on forever instead of a window after pressing A (debugging aid).
++const ALWAYS_ON: bool = false;
++/// Polling period while the window is open (only to notice its end; APDUs wake us via events).
++/// Kept long: every syscall runs critical sections that mask the NFCT interrupt.
++pub const POLL_MS: usize = 1000;
++
++const FIDO_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
++const SW_OK: [u8; 2] = [0x90, 0x00];
++const SW_WRONG_LENGTH: [u8; 2] = [0x67, 0x00];
++const SW_CONDITIONS: [u8; 2] = [0x69, 0x85];
++const SW_FILE_NOT_FOUND: [u8; 2] = [0x6A, 0x82];
++const SW_INS_NOT_SUPPORTED: [u8; 2] = [0x6D, 0x00];
++const SW_CLA_NOT_SUPPORTED: [u8; 2] = [0x6E, 0x00];
++
++/// Set by the platform event handler; checked by the USB receive loop so it returns early.
++static NOTIFIED: AtomicBool = AtomicBool::new(false);
++
++pub fn take_notified() -> bool {
++    NOTIFIED.swap(false, Relaxed)
++}
++
++pub fn is_notified() -> bool {
++    NOTIFIED.load(Relaxed)
++}
++
++extern "C" fn on_event(_data: *const u8) {
++    NOTIFIED.store(true, Relaxed);
++}
++
++pub struct Nfc {
++    window: Option<Timeout>,
++    selected: bool,
++    /// Data accumulated over chained C-APDUs (CLA bit 4).
++    chained: Vec<u8>,
++    /// Remaining response bytes for GET RESPONSE.
++    pending: Vec<u8>,
++    buffer: Vec<u8>,
++}
++
++impl Nfc {
++    pub fn new() -> Option<Self> {
++        let func = on_event as extern "C" fn(*const u8);
++        // Safety: the handler is a plain function without data.
++        unsafe { syscall(SYSCALL_ID, OP_REGISTER, func as usize, 0) }.ok()?;
++        let mut nfc = Nfc {
++            window: None,
++            selected: false,
++            chained: Vec::new(),
++            pending: Vec::new(),
++            buffer: alloc::vec![0; 4096],
++        };
++        // NFC stays off until button A is pressed (see `service`).
++        if ALWAYS_ON {
++            nfc.open_window();
++        }
++        Some(nfc)
++    }
++
++    /// Whether the NFC window is open (the main loop should then poll every [`POLL_MS`]).
++    pub fn is_active(&self) -> bool {
++        self.window.is_some()
++    }
++
++    fn status() -> usize {
++        unsafe { syscall(SYSCALL_ID, OP_STATUS, 0, 0) }.unwrap_or(0)
++    }
++
++    fn open_window(&mut self) {
++        if self.window.is_none() {
++            let _ = unsafe { syscall(SYSCALL_ID, OP_START, 0, 0) };
++            debug!("NFC window opened");
++        }
++        self.window = Some(Timeout::new_ms(WINDOW_MS));
++    }
++
++    fn close_window(&mut self) {
++        let _ = unsafe { syscall(SYSCALL_ID, OP_STOP, 0, 0) };
++        self.window = None;
++        self.reset_session();
++        debug!("NFC window closed");
++    }
++
++    fn reset_session(&mut self) {
++        self.selected = false;
++        self.chained.clear();
++        self.pending.clear();
++    }
++
++    /// Services NFC: button presses, incoming APDUs and the window timeout.
++    pub fn service<E: opensk::env::Env>(&mut self, ctap: &mut opensk::Ctap<E>) {
++        let status = Self::status();
++        if status & STATUS_BUTTON != 0 {
++            self.open_window();
++        }
++        if self.window.is_none() {
++            return;
++        }
++        if status & STATUS_FIELD != 0 {
++            // Keep the window open while a reader is talking to us (never shorten it).
++            if self.window.as_ref().is_some_and(Timeout::is_over) {
++                self.window = Some(Timeout::new_ms(WINDOW_MS));
++            }
++        } else {
++            self.reset_session();
++        }
++        if status & STATUS_APDU != 0 {
++            let len = unsafe {
++                syscall(SYSCALL_ID, OP_READ, self.buffer.as_mut_ptr() as usize, self.buffer.len())
++            }
++            .unwrap_or(0);
++            if len > 0 {
++                let apdu = self.buffer[.. len].to_vec();
++                let response = self.process(ctap, &apdu);
++                let _ = unsafe {
++                    syscall(SYSCALL_ID, OP_SEND, response.as_ptr() as usize, response.len())
++                };
++            }
++        }
++        if self.window.as_ref().is_some_and(Timeout::is_over) {
++            if ALWAYS_ON {
++                self.window = Some(Timeout::new_ms(WINDOW_MS));
++            } else {
++                self.close_window();
++            }
++        }
++    }
++
++    fn process<E: opensk::env::Env>(&mut self, ctap: &mut opensk::Ctap<E>, apdu: &[u8]) -> Vec<u8> {
++        let Some(cmd) = Apdu::parse(apdu) else {
++            return SW_WRONG_LENGTH.to_vec();
++        };
++        let cla = cmd.cla & !0x10;
++        // GET RESPONSE (ISO 7816-4), continuing a chained response.
++        if cmd.ins == 0xC0 && cla == 0x00 {
++            return self.next_chunk(cmd.le);
++        }
++        match (cla, cmd.ins) {
++            (0x00, 0xA4) => {
++                self.reset_session();
++                if cmd.p1 == 0x04 && cmd.data == FIDO_AID {
++                    self.selected = true;
++                    // CTAP2-only over NFC (no U2F over NFC): advertise FIDO_2_0.
++                    let mut response = b"FIDO_2_0".to_vec();
++                    response.extend_from_slice(&SW_OK);
++                    response
++                } else {
++                    SW_FILE_NOT_FOUND.to_vec()
++                }
++            }
++            (0x80, 0x10) => {
++                if !self.selected {
++                    return SW_CONDITIONS.to_vec();
++                }
++                self.chained.extend_from_slice(cmd.data);
++                if cmd.cla & 0x10 != 0 {
++                    return SW_OK.to_vec(); // more chained data follows
++                }
++                let request = core::mem::take(&mut self.chained);
++                let mut response = ctap.process_nfc_command(&request);
++                if response == [0x00] {
++                    // Success without data (e.g. clientPin setPIN): Google Play Services decodes the
++                    // bytes after the status as CBOR even then and fails on what follows ("90 00"
++                    // read as array(16)); an explicit empty map keeps it happy and other platforms
++                    // ignore it.
++                    response.push(0xA0);
++                }
++                self.pending = response;
++                if cmd.extended {
++                    // Extended APDU: the platform expects the whole response in one R-APDU
++                    // (Google Play Services' FIDO stack does not follow 61 XX here); the ISO-DEP
++                    // layer chains the I-blocks itself.
++                    let mut full = core::mem::take(&mut self.pending);
++                    full.extend_from_slice(&SW_OK);
++                    full
++                } else {
++                    // Short APDU: chain with 61 XX + GET RESPONSE.
++                    self.next_chunk(cmd.le)
++                }
++            }
++            (0x80, 0x11) => SW_CONDITIONS.to_vec(), // NFCCTAP_GETRESPONSE: we answer synchronously
++            (0x00 | 0x80, _) => SW_INS_NOT_SUPPORTED.to_vec(),
++            _ => SW_CLA_NOT_SUPPORTED.to_vec(),
++        }
++    }
++
++    /// Returns the next chunk of the pending response with `61 XX` or `90 00`.
++    fn next_chunk(&mut self, le: usize) -> Vec<u8> {
++        // At most 250 bytes per R-APDU: the Type 4 Tag library is reported to lose bytes when it
++        // has to fragment longer responses (solo2 nrf52840 runner).
++        let max = if le == 0 { 250 } else { le.min(250) };
++        let take = self.pending.len().min(max);
++        let mut response: Vec<u8> = self.pending.drain(.. take).collect();
++        match self.pending.len() {
++            0 => response.extend_from_slice(&SW_OK),
++            n => response.extend_from_slice(&[0x61, n.min(0xFF) as u8]),
++        }
++        response
++    }
++}
++
++struct Apdu<'a> {
++    cla: u8,
++    ins: u8,
++    p1: u8,
++    data: &'a [u8],
++    le: usize,
++    extended: bool,
++}
++
++impl<'a> Apdu<'a> {
++    /// Parses a short or extended ISO 7816-4 command APDU (cases 1 to 4).
++    fn parse(apdu: &'a [u8]) -> Option<Self> {
++        let (cla, ins, p1, _p2) = (*apdu.first()?, *apdu.get(1)?, *apdu.get(2)?, *apdu.get(3)?);
++        let body = &apdu[4 ..];
++        let mut cmd = Apdu { cla, ins, p1, data: &[], le: 0, extended: false };
++        match body.len() {
++            0 => (),
++            1 => cmd.le = body[0] as usize,
++            _ if body[0] != 0 => {
++                let lc = body[0] as usize;
++                cmd.data = body.get(1 .. 1 + lc)?;
++                match body.len() - 1 - lc {
++                    0 => (),
++                    1 => cmd.le = body[1 + lc] as usize,
++                    _ => return None,
++                }
++            }
++            3 => {
++                cmd.extended = true;
++                cmd.le = u16::from_be_bytes([body[1], body[2]]) as usize;
++            }
++            _ => {
++                cmd.extended = true;
++                let lc = u16::from_be_bytes([*body.get(1)?, *body.get(2)?]) as usize;
++                cmd.data = body.get(3 .. 3 + lc)?;
++                match body.len() - 3 - lc {
++                    0 => (),
++                    2 => cmd.le = u16::from_be_bytes([body[3 + lc], body[4 + lc]]) as usize,
++                    _ => return None,
++                }
++            }
++        }
++        Some(cmd)
++    }
++}
+diff --git a/tools/techo_apdus.py b/tools/techo_apdus.py
+new file mode 100644
+index 0000000..3d762e0
+--- /dev/null
++++ b/tools/techo_apdus.py
+@@ -0,0 +1,34 @@
++"""Rebuilds full C-/R-APDUs from a techo_markers --trace output and decodes CTAP2 CBOR."""
++import sys, re
++lines = open(sys.argv[1]).read().splitlines()
++apdus = []
++cur = None
++for l in lines:
++    m = re.search(r"(C|R)-APDU  len=(\d+) head=([0-9a-f]{8})", l)
++    if m:
++        cur = [m.group(1), int(m.group(2)), bytearray.fromhex(m.group(3))]
++        apdus.append(cur)
++        continue
++    m = re.search(r"C-APDU bytes 4..11 = ([0-9a-f]{16})", l)
++    if m and cur and cur[0] == "C":
++        cur[2] += bytes.fromhex(m.group(1)); continue
++    m = re.search(r"(C|R)-DATA ([0-9a-f]{16})", l)
++    if m and cur and cur[0] == m.group(1):
++        cur[2] += bytes.fromhex(m.group(2))
++for kind, n, data in apdus:
++    data = bytes(data[:n])
++    print(f"{kind} len={n}: {data.hex()}")
++    try:
++        import cbor2
++        if kind == "C" and data[:2] == b"\x80\x10":
++            if data[4] == 0:
++                body = data[7:7 + int.from_bytes(data[5:7], "big")]
++            else:
++                body = data[5:5 + data[4]]
++            print("   cmd", hex(body[0]), cbor2.loads(body[1:]) if len(body) > 1 else "")
++        if kind == "R" and n > 3 and data[0] == 0:
++            print("   ", cbor2.loads(data[1:-2]))
++        elif kind == "R" and n == 3:
++            print("    CTAP status", hex(data[0]))
++    except Exception as e:
++        print("   (decode:", type(e).__name__, e, ")")
+diff --git a/tools/techo_markers.py b/tools/techo_markers.py
+new file mode 100644
+index 0000000..4c7f945
+--- /dev/null
++++ b/tools/techo_markers.py
+@@ -0,0 +1,209 @@
++#!/usr/bin/env python3
++"""Decode the T-Echo bring-up marker page (0xE9000) from a CURRENT.UF2 dump.
++
++Usage: techo_markers.py /Volumes/NRF52BOOT/CURRENT.UF2
++"""
++import struct
++import sys
++
++MARKER_PAGE = 0xE9000
++STAGES = {
++    1: "Wasefire bootloader started",
++    2: "Wasefire bootloader about to jump to runner",
++    3: "runner main() started",
++    4: "runner: GPIO/timers set up, about to start HFXO",
++    5: "runner: HFXO (32 MHz crystal) running",
++    6: "runner: USB device created",
++    7: "runner: storage initialised",
++    8: "runner: entering scheduler (OpenSK)",
++}
++
++
++def main():
++    data = open(sys.argv[1], "rb").read()
++    mem = {}
++    for i in range(len(data) // 512):
++        blk = data[i * 512:(i + 1) * 512]
++        addr, size = struct.unpack("<II", blk[12:20])
++        mem[addr] = blk[32:32 + size]
++    page = b"".join(mem.get(MARKER_PAGE + off, b"\xee" * 256) for off in range(0, 0x1000, 256))
++    words = struct.unpack("<1024I", page)
++    if all(w == 0xEEEEEEEE for w in words):
++        sys.exit("marker page not present in dump")
++    reached = [n for n in STAGES if words[n] == 0xC0DE0000 | n]
++    for n, desc in STAGES.items():
++        print(f"  [{'x' if n in reached else ' '}] {n}: {desc}")
++    if words[0x10] != 0xFFFFFFFF:
++        rr = words[0x13]
++        if rr != 0xFFFFFFFF:
++            names = {0:'RESETPIN(B)',1:'DOG',2:'SREQ(soft reset)',3:'LOCKUP',16:'OFF',17:'LPCOMP',18:'DIF',19:'NFC',20:'VBUS'}
++            print(f"  boot reset reason RESETREAS=0x{rr:08X} " + ",".join(n for b,n in names.items() if rr>>b&1) + (" (power-on)" if rr==0 else ""))
++        print(f"  jump target vector table 0x{words[0x10]:08X}: SP=0x{words[0x11]:08X} "
++              f"reset=0x{words[0x12]:08X}")
++    if words[0x20] != 0xFFFFFFFF:
++        r = words[0x20]
++        print(f"  USB at stage 6: USBREGSTATUS=0x{r:X} (VBUSDETECT={r & 1}, OUTPUTRDY={(r >> 1) & 1}) "
++              f"USBPULLUP={words[0x21]} USBD.ENABLE={words[0x22]}")
++    print("  first USBD interrupt:", f"EVENTCAUSE=0x{words[0x23] & 0xFFFFFFF:X}" if words[0x23] != 0xFFFFFFFF else "never")
++    print("  host bus reset seen:", words[0x24] == 0xBE5E7)
++    print("  host assigned address:", words[0x25] == 0xADD)
++    print("  host configured device:", words[0x26] == 0xC0F16)
++    if words[0x27] != 0xFFFFFFFF:
++        print(f"  KEY_1 (P1.10) idle level after pull-up: {words[0x27] & 1} (1 = released, as expected)")
++    print("  button interrupt (GPIOTE) seen:", words[0x28] == 0x9107)
++    names = {1: "FIELD_ON", 2: "FIELD_OFF", 3: "NDEF_READ", 4: "NDEF_UPDATED", 5: "DATA_TRANSMITTED", 6: "DATA_IND"}
++    print("  NFC registered by OpenSK:", words[0x30] == 0x4E01)
++    if words[0x31] != 0xFFFFFFFF:
++        print(f"  nfc_t4t_setup result: {-(0x10000 - (words[0x31] & 0xffff)) if words[0x31] & 0x8000 else words[0x31] & 0xffff}")
++    print("  button A PORT event:", "never" if words[0x32] == 0xFFFFFFFF else f"seen (pressed={words[0x32] & 1})")
++    if words[0x33] != 0xFFFFFFFF:
++        v = words[0x33] & 0xffff
++        print(f"  nfc_t4t_emulation_start result: {v - 0x10000 if v & 0x8000 else v}")
++    else:
++        print("  nfc_t4t_emulation_start: never called")
++    seen = [names.get(e, e) for e in range(8) if words[0x34 + e] != 0xFFFFFFFF]
++    print("  T4T events seen:", seen or "none")
++    if words[0x60] != 0xFFFFFFFF:
++        ev = words[0x60]
++        bits = {1: "FIELDDETECTED", 2: "FIELDLOST", 3: "TXFRAMESTART", 4: "TXFRAMEEND", 5: "RXFRAMESTART", 6: "RXFRAMEEND", 7: "ERROR", 19: "SELECTED", 20: "STARTED"}
++        print("  nrfx events at platform handler:", [n for b, n in bits.items() if ev >> b & 1], hex(ev))
++        print(f"  ACTIVATE forces: {words[0x61]}, deferred callbacks: {words[0x62]}, NFCTAGSTATE after force: {words[0x63]}, buffer alloc failures: {words[0x64]}")
++        print(f"  NFCT at first FIELD_OFF: ERRORSTATUS=0x{words[0x55]:X} SENSRES=0x{words[0x56]:X} SELRES=0x{words[0x57]:X} AUTOCOLRESCONFIG=0x{words[0x58]:X} NFCID1_LAST=0x{words[0x59]:X} INTEN=0x{words[0x5A]:X}")
++    if words[0x55] != 0xFFFFFFFF:
++        print(f"  IRQ counts at first FIELD_OFF: NFCT={words[0x65]} TIMER0={words[0x66]}")
++        print(f"  NVIC ISER0=0x{words[0x5B]:08X} (NFCT bit5={words[0x5B] >> 5 & 1}, TIMER0 bit8={words[0x5B] >> 8 & 1}) TIMER0 INTEN=0x{words[0x5C]:X} CC0={words[0x5D]} BITMODE={words[0x5E]} PRESCALER={words[0x5F]}")
++    print("  first TIMER0 IRQ:", "never" if words[0x70] == 0xFFFFFFFF else f"yes (EVENTS_COMPARE0={words[0x70] & 0xff})")
++    print("  first NFCT IRQ:", "never" if words[0x71] == 0xFFFFFFFF else "yes")
++    if words[0x72] != 0xFFFFFFFF:
++        print(f"  at FIELD_DETECTED: NVIC ISER0=0x{words[0x72]:08X} (NFCT={words[0x72] >> 5 & 1} TIMER0={words[0x72] >> 8 & 1}) TIMER0 INTEN=0x{words[0x73]:X} CC0={words[0x74]} PRESCALER={words[0x75]} SHORTS=0x{words[0x76]:X} IPR2=0x{words[0x77]:08X} PRIMASK={words[0x78] & 1}")
++    evn = ["FIELDDETECTED", "FIELDLOST", "AUTOCOLRESSTARTED", "COLLISION", "SELECTED", "RXFRAMESTART", "RXFRAMEEND", "RXERROR", "TXFRAMESTART", "ERROR"]
++    hw = [n for i, n in enumerate(evn) if words[0x80 + i] != 0xFFFFFFFF]
++    print("  NFCT hardware events seen:", hw or "none")
++    if words[0x87] != 0xFFFFFFFF:
++        print(f"    RXERROR FRAMESTATUS.RX=0x{words[0x87] & 0xffff:X} (bit0 CRC, bit2 parity, bit3 overrun)")
++    if words[0x89] != 0xFFFFFFFF:
++        print(f"    ERROR ERRORSTATUS=0x{words[0x89] & 0xffff:X} (bit0 FRAMEDELAYTIMEOUT, bit2 FIELD TOO STRONG, bit3 TOO WEAK)")
++    if words[0x8A] != 0xFFFFFFFF:
++        print(f"    at SELECTED: MAXLEN={words[0x8A]} PACKETPTR=0x{words[0x8B]:08X}")
++    if words[0x8C] != 0xFFFFFFFF:
++        print(f"    first RXFRAMEEND: RXD.AMOUNT=0x{words[0x8C]:X} (bytes={words[0x8C] >> 3 & 0x1ff}) first bytes={words[0x8D].to_bytes(4, 'little').hex() if words[0x8D] != 0xFFFFFFFF else '?'}")
++    if words[0x8E] != 0xFFFFFFFF:
++        print(f"    at RXERROR: MAXLEN={words[0x8E]} RXD.AMOUNT=0x{words[0x8F]:X}")
++    print("  first RTC2 flush-timer tick: ", "never" if words[0x90] == 0xFFFFFFFF else f"trace len then={words[0x90] & 0xffff}")
++    print("  first flush attempt: ", "never" if words[0x91] == 0xFFFFFFFF else f"trace len={words[0x91] & 0xffff}")
++    if words[0x92] != 0xFFFFFFFF:
++        print(f"  !!! INTERRUPT STORM: NFCT irqs={words[0x92] & 0xffff} NFCT.INTEN=0x{words[0x93]:X} TIMER0.INTEN=0x{words[0x94]:X} TIMER0.COMPARE0={words[0x95]} ICSR=0x{words[0x96]:08X} (VECTACTIVE={words[0x96] & 0x1ff}, VECTPENDING={(words[0x96] >> 12) & 0x1ff})")
++    hist = [words[0xC0 + k] for k in range(48) if words[0xC0 + k] != 0xFFFFFFFF]
++    if hist:
++        print("  per-second history (sec: trace_len nfct_irqs timer0_irqs tagstate fieldpresent):")
++        for k, h in enumerate(hist):
++            print(f"    {k:2d}s: len={h & 0xff} nfct={(h >> 8) & 0xfff} tmr0={(h >> 20) & 0xf} state={(h >> 24) & 7} field={(h >> 27) & 3}")
++    samples = [(k, words[0x340 + 4 * k: 0x344 + 4 * k]) for k in range(48) if words[0x340 + 4 * k] != 0xFFFFFFFF]
++    if samples:
++        print("  hang finder (sec: interrupted PC, active IRQs, SHCSR, VECTPENDING):")
++        for k, (h, pc, a0, a1) in samples:
++            print(f"    {k:2d}s: PC=0x{pc:08X} LR=0x{h:08X} IABR0=0x{a0:08X} IABR1=0x{a1 & 0xffff:04X} SHCSR=0x{(a1 >> 16) & 0xff:02X} VECTPENDING={a1 >> 24}")
++    print("  C-APDU complete in runner:", "never" if words[0xA5] == 0xFFFFFFFF else f"len={words[0xA5] & 0xffff}")
++    print("  applet read APDU:", "never" if words[0xA0] == 0xFFFFFFFF else f"len={words[0xA0] & 0xffff} head={words[0xA1]:08x}")
++    print("  applet sent R-APDU:", "never" if words[0xA2] == 0xFFFFFFFF else f"len={words[0xA2] & 0xffff} head={words[0xA3]:08x} send_result={(words[0xA4] & 0xffff) - (0x10000 if words[0xA4] & 0x8000 else 0)}")
++    if words[0xA6] != 0xFFFFFFFF and words[0xA8] != 0xFFFFFFFF:
++        print(f"  latency: APDU complete -> applet read = {((words[0xA8] - words[0xA6]) & 0xffffffff) / 64:.0f} us")
++    if words[0xA6] != 0xFFFFFFFF and words[0xA7] != 0xFFFFFFFF:
++        print(f"  latency: APDU complete -> response sent = {((words[0xA7] - words[0xA6]) & 0xffffffff) / 64:.0f} us")
++    if words[0x40] == 0xFA17FA17:
++        src = {1: "bootloader handler (fault before runner set VTOR)",
++               2: "runner HardFault", 0x9A41: "runner panic"}.get(words[0x41], hex(words[0x41]))
++        print(f"  FAULT from {src}: PC=0x{words[0x42]:08X} LR=0x{words[0x43]:08X} "
++              f"CFSR=0x{words[0x44]:08X} HFSR=0x{words[0x45]:08X} "
++              f"BFAR=0x{words[0x46]:08X} MMFAR=0x{words[0x47]:08X}")
++    else:
++        print("  no fault recorded")
++    print(f"LAST STAGE: {max(reached) if reached else 0}")
++
++
++if __name__ == "__main__":
++    main()
++
++
++def dump_trace(path):
++    """Prints the NFC trace (marker page words 0x100.., count at 0xFF)."""
++    import struct as st
++    data = open(path, "rb").read()
++    mem = {}
++    for i in range(len(data) // 512):
++        blk = data[i * 512:(i + 1) * 512]
++        addr, size = st.unpack("<II", blk[12:20])
++        mem[addr] = blk[32:32 + size]
++    page = b"".join(mem.get(MARKER_PAGE + off, b"\xee" * 256) for off in range(0, 0x1000, 256))
++    w = st.unpack("<1024I", page)
++    # Flight-recorder log: 0xE0000..0xE9000, 16-byte entries (erased entries = gaps).
++    logb = b"".join(mem.get(0xE0000 + off, b"\xff" * 256) for off in range(0, 0x9000, 256))
++    lw = st.unpack(f"<{len(logb) // 4}I", logb)
++    entries = [lw[4 * i: 4 * i + 4] for i in range(len(lw) // 4)]
++    last = max((i for i, e in enumerate(entries) if e[0] != 0xFFFFFFFF), default=-1)
++    if last < 0:
++        print("no NFC trace recorded")
++        return
++    if w[0x6E] != 0x10C:
++        print("NOTE: this log was written by an EARLIER boot (no NFC session since the last boot)")
++    names = {1: "IRQ>", 2: "IRQ<", 3: "rx()", 4: "rx=", 5: "tx()", 6: "tx=", 7: "plat", 8: "cbrq", 9: "app ", 10: "TMR0", 0xEE: "BOOT", 0xE1: "start", 0xE2: "stop", 0xF5: "FSD64", 0xF6: "rx-kept", 0xF7: "rx-copy"}
++    if w[0xFE] != 0xFFFFFFFF:
++        print(f"first flush: DIAG events=0x{w[0x60]:X} forces={w[0x61]} cbreq={w[0x62]} NFCT_irq={w[0x65]} TIMER0_irq={w[0x66]}")
++    ev = ["FDET", "FLOST", "ACRS", "COLL", "SEL", "RXS", "RXE", "RXERR", "TXS", "ERR", "TXE", "ENDRX", "ENDTX"]
++    t0 = None
++    print(f"NFC trace: {last + 1} entries")
++    gap = False
++    for i in range(last + 1):
++        tag, a, b, cyc = entries[i]
++        if tag == 0xFFFFFFFF:
++            if not gap:
++                print("  ... (entries lost: RAM ring overwritten) ...")
++            gap = True
++            continue
++        gap = False
++        t0 = cyc if t0 is None else t0
++        us = ((cyc - t0) & 0xFFFFFFFF) / 64
++        if tag == 1:
++            evs = [e for k, e in enumerate(ev) if a >> k & 1]
++            d = f"events={evs} FRAMESTATUS.RX=0x{a >> 16:X} MAXLEN={b & 0xffff} RXD.AMOUNT=0x{b >> 16:X}"
++        elif tag == 2:
++            d = f"MAXLEN={a} PACKETPTR=0x{b:X}"
++        elif tag == 3:
++            d = f"size={a} ptr=0x{b:08X}"
++        elif tag == 4:
++            d = f"ret={a - (1 << 32) if a >> 31 else a} MAXLEN={b}"
++        elif tag == 5:
++            d = f"size={a & 0xffffff} delay_mode={a >> 24} data={b.to_bytes(4, 'little').hex()}"
++        elif tag == 6:
++            d = f"ret={a - (1 << 32) if a >> 31 else a}"
++        elif tag == 7 and (a & 0xff) == 0x40:
++            d = f"RX_FRAMEEND rx_status=0x{(a >> 8) & 0xff:X} size={a >> 16} data={b.to_bytes(4, 'little').hex()}"
++        elif tag == 7:
++            d = f"nrfx evt=0x{a:X} HFCLKSTAT=0x{b:X}"
++        elif tag == 0xA6:
++            d = f"EMPTY I-block answered: send(0)={a - (1 << 32) if a >> 31 else a} send(9000)={b - (1 << 32) if b >> 31 else b}"
++        elif tag == 0xA5:
++            d = f"C-APDU  len={a} head={b:08x}"
++        elif tag == 0xA8:
++            d = f"   C-APDU bytes 4..11 = {a:08x}{b:08x}"
++        elif tag == 0xA7:
++            d = f"R-APDU  len={a} head={b:08x}"
++        elif tag == 0xA9:
++            d = f"   R-APDU SW={a:04X} send_result={b - (1 << 32) if b >> 31 else b}"
++        elif tag == 0xAA:
++            d = f"   C-DATA {a:08x}{b:08x}"
++        elif tag == 0xAB:
++            d = f"   R-DATA {a:08x}{b:08x}"
++        elif tag == 8:
++            d = f"ctx=0x{a:08X} data=0x{b:08X}"
++        elif tag == 9:
++            d = f"T4T event={a} len={b}"
++        elif tag == 10:
++            d = f"COMPARE0={a} NFCTAGSTATE={b}"
++        else:
++            d = f"{a:X} {b:X}"
++        print(f"  {us:10.1f} us  {names.get(tag, tag)}  {d}")
++
++
++if len(sys.argv) > 2 and sys.argv[2] == "--trace":
++    dump_trace(sys.argv[1])
+diff --git a/tools/techo_uf2.py b/tools/techo_uf2.py
+new file mode 100644
+index 0000000..2895e72
+--- /dev/null
++++ b/tools/techo_uf2.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/env python3
++"""Convert Wasefire/OpenSK platform.hex into a UF2 for the LilyGO T-Echo Card.
++
++The T-Echo Card ships with the Adafruit nRF52 UF2 bootloader (top of flash) and
++a SoftDevice at 0x1000..0x27000. OpenSK/Wasefire replaces the SoftDevice region
++with its own bootloader (0x1000) and runner (0x8000). Any page of the old
++SoftDevice left untouched (e.g. its magic word at 0x3000) would make the UF2
++bootloader think a SoftDevice is still present and jump into garbage, so we
++pad every gap in 0x1000..0xE0000 with 0xFF (also clears leftovers of the
++previous application in the runner/applet/store regions).
++
++Safety: refuses to emit data below 0x1000 (MBR) or at/above 0xE0000
++(UF2 bootloader + its settings), so the bootloader stays recoverable.
++
++The OpenSK store (0xDA000..0xE0000: passkeys, PIN) is left untouched unless --wipe-store.
++
++Usage: techo_uf2.py [--wipe-store] <platform.hex> <out.uf2>
++"""
++import struct
++import sys
++
++FAMILY_NRF52840 = 0xADA52840
++LOW, HIGH = 0x1000, 0xE0000
++SD_END = 0x27000
++# Diagnostics marker page (see runner-nordic/src/techo_debug.rs). Inside the UF2
++# bootloader's app space (< 0xEA000 on nRF52840) but outside the Wasefire layout (< 0xE0000).
++MARKER_PAGE, MARKER_END = 0xE9000, 0xEA000
++BLOCK = 256
++# OpenSK persistent store (credentials, PIN, master keys): never written by default, so a
++# firmware update keeps the user's passkeys. Pass --wipe-store to erase it on purpose.
++STORE, STORE_END = 0xDA000, 0xE0000
++
++
++def read_hex(path):
++    mem, base = {}, 0
++    with open(path) as f:
++        for line in f:
++            line = line.strip()
++            if not line.startswith(":"):
++                continue
++            raw = bytes.fromhex(line[1:])
++            if sum(raw) & 0xFF:
++                sys.exit(f"bad checksum: {line}")
++            n, addr, typ = raw[0], (raw[1] << 8) | raw[2], raw[3]
++            data = raw[4:4 + n]
++            if typ == 0:
++                for i, b in enumerate(data):
++                    mem[base + addr + i] = b
++            elif typ == 1:
++                break
++            elif typ == 2:
++                base = int.from_bytes(data, "big") << 4
++            elif typ == 4:
++                base = int.from_bytes(data, "big") << 16
++    return mem
++
++
++def main():
++    args = [a for a in sys.argv[1:] if a != "--wipe-store"]
++    wipe_store = "--wipe-store" in sys.argv[1:]
++    if len(args) != 2:
++        sys.exit(__doc__)
++    sys.argv[1:] = args
++    mem = read_hex(sys.argv[1])
++    if not mem:
++        sys.exit("empty hex")
++    lo, hi = min(mem), max(mem)
++    if lo < LOW or hi >= HIGH:
++        sys.exit(f"refusing: data spans 0x{lo:X}..0x{hi:X}, allowed 0x{LOW:X}..0x{HIGH:X}")
++    # Wipe every gap up to HIGH so no stale code from the previous firmware
++    # (SoftDevice, factory/Meshtastic app) is left in the runner, applet or
++    # store regions.
++    for a in range(LOW, HIGH):
++        mem.setdefault(a, 0xFF)
++    for a in range(MARKER_PAGE, MARKER_END):
++        mem[a] = 0xFF
++    if not wipe_store:
++        if any(STORE <= a < STORE_END and mem[a] != 0xFF for a in range(STORE, STORE_END)):
++            sys.exit("refusing: the image has data in the store region")
++        for a in range(STORE, STORE_END):
++            del mem[a]
++    pages = sorted({a & ~(BLOCK - 1) for a in mem})
++    blocks = []
++    for i, page in enumerate(pages):
++        payload = bytes(mem.get(page + j, 0xFF) for j in range(BLOCK))
++        hdr = struct.pack("<IIIIIIII", 0x0A324655, 0x9E5D5157, 0x2000, page, BLOCK, i,
++                          len(pages), FAMILY_NRF52840)
++        blk = hdr + payload + b"\x00" * (512 - 32 - BLOCK - 4) + struct.pack("<I", 0x0AB16F30)
++        blocks.append(blk)
++    with open(sys.argv[2], "wb") as f:
++        f.write(b"".join(blocks))
++    print(f"wrote {sys.argv[2]}: {len(blocks)} blocks, 0x{pages[0]:X}..0x{pages[-1] + BLOCK:X}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/usbalive.py b/tools/usbalive.py
+new file mode 100644
+index 0000000..75636d2
+--- /dev/null
++++ b/tools/usbalive.py
+@@ -0,0 +1,15 @@
++import time, sys
++from fido2.hid import CtapHidDevice
++from fido2.ctap2 import Ctap2
++last = None
++end = time.time() + float(sys.argv[1] if len(sys.argv) > 1 else 900)
++while time.time() < end:
++    try:
++        d = list(CtapHidDevice.list_devices())
++        st = "alive" if d and Ctap2(d[0]).get_info() else "absent"
++    except Exception as e:
++        st = "error " + type(e).__name__
++    if st != last:
++        print(time.strftime("%T"), st, flush=True)
++        last = st
++    time.sleep(1)
+diff --git a/tools/usbcrypto.py b/tools/usbcrypto.py
+new file mode 100644
+index 0000000..51005fe
+--- /dev/null
++++ b/tools/usbcrypto.py
+@@ -0,0 +1,16 @@
++import time
++from fido2.hid import CtapHidDevice
++from fido2.ctap2 import Ctap2
++from fido2.ctap2.pin import ClientPin, PinProtocolV2
++for _ in range(600):
++    devs = list(CtapHidDevice.list_devices())
++    if devs: break
++    time.sleep(1)
++if not devs:
++    print("no FIDO device over USB"); raise SystemExit
++ctap = Ctap2(devs[0])
++t = time.time(); info = ctap.get_info(); print("getInfo ok, clientPin =", info.options.get("clientPin"), f"{(time.time()-t)*1000:.0f} ms")
++cp = ClientPin(ctap, PinProtocolV2())
++t = time.time(); ka = cp._get_shared_secret(); print(f"getKeyAgreement + ECDH ok in {(time.time()-t)*1000:.0f} ms")
++for i in range(3):
++    t = time.time(); cp._get_shared_secret(); print(f"getKeyAgreement + ECDH #{i+2}: {(time.time()-t)*1000:.0f} ms")
+diff --git a/tools/usbpersist.py b/tools/usbpersist.py
+new file mode 100644
+index 0000000..20f0293
+--- /dev/null
++++ b/tools/usbpersist.py
+@@ -0,0 +1,28 @@
++# usbpersist.py create  -> makes a resident test credential for rp "persist.invalid" (press A)
++# usbpersist.py check   -> silent getAssertion (up=false) for that credential: KEPT / GONE
++import sys, os, time, hashlib, json
++from fido2.hid import CtapHidDevice
++from fido2.ctap2 import Ctap2
++from fido2.ctap import CtapError
++F = "persist_cred.json"  # written to the current directory
++for _ in range(600):
++    devs = [d for d in CtapHidDevice.list_devices() if d.descriptor.product_name == "Wasefire"]
++    if devs: break
++    time.sleep(1)
++ctap = Ctap2(devs[0])
++cdh = hashlib.sha256(b"persist").digest()
++if sys.argv[1] == "create":
++    print("press button A", flush=True)
++    att = ctap.make_credential(cdh, {"id": "persist.invalid", "name": "persist"},
++                               {"id": b"persist-user", "name": "p"}, [{"type": "public-key", "alg": -7}],
++                               options={"rk": True})
++    cid = att.auth_data.credential_data.credential_id
++    json.dump({"id": cid.hex()}, open(F, "w"))
++    print("created", cid.hex()[:16], time.strftime("%T"))
++else:
++    cid = bytes.fromhex(json.load(open(F))["id"])
++    try:
++        ctap.get_assertion("persist.invalid", cdh, [{"type": "public-key", "id": cid}], options={"up": False})
++        print("KEPT", time.strftime("%T"))
++    except CtapError as e:
++        print("GONE", e, time.strftime("%T"))
+diff --git a/tools/usbsigtest.py b/tools/usbsigtest.py
+new file mode 100644
+index 0000000..2ca2cc4
+--- /dev/null
++++ b/tools/usbsigtest.py
+@@ -0,0 +1,35 @@
++# Registers a throw-away credential for rp "sigtest.invalid" over USB and verifies the
++# attestation and assertion signatures on the host (press button A when the LED asks).
++import os, time, hashlib
++from fido2.hid import CtapHidDevice
++from fido2.ctap2 import Ctap2
++from fido2.cose import CoseKey
++for _ in range(600):
++    devs = list(CtapHidDevice.list_devices())
++    if devs: break
++    time.sleep(1)
++ctap = Ctap2(devs[0])
++cdh = hashlib.sha256(b"client-data").digest()
++print("makeCredential: press button A now", flush=True)
++att = ctap.make_credential(cdh, {"id": "sigtest.invalid", "name": "sigtest"},
++                           {"id": os.urandom(16), "name": "t"}, [{"type": "public-key", "alg": -7}])
++print("fmt:", att.fmt)
++cred = att.auth_data.credential_data
++pub = CoseKey.parse(cred.public_key) if not isinstance(cred.public_key, CoseKey) else cred.public_key
++try:
++    from fido2.attestation import PackedAttestation
++    if att.fmt == "packed":
++        PackedAttestation().verify(att.att_stmt, att.auth_data, cdh)
++        print("attestation signature: OK")
++    else:
++        print("attestation fmt", att.fmt, "not checked")
++except Exception as e:
++    print("attestation signature: FAILED", type(e).__name__, e)
++print("getAssertion: press button A now", flush=True)
++a = ctap.get_assertion("sigtest.invalid", cdh, [{"type": "public-key", "id": cred.credential_id}])
++try:
++    pub.verify(bytes(a.auth_data) + cdh, a.signature)
++    print("assertion signature: OK")
++except Exception as e:
++    print("assertion signature: FAILED", type(e).__name__, e)
++print("sig hex:", a.signature.hex())
